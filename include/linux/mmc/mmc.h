@@ -239,6 +239,7 @@ static inline bool mmc_op_multi(u32 opcode)
  * EXT_CSD fields
  */
 
+
 #define EXT_CSD_CMDQ_MODE_EN		15	/* R/W */
 #define EXT_CSD_FFU_STATUS			26	/* R */
 #define EXT_CSD_MODE_OPERATION_CODES	29	/* W */
