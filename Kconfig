@@ -9,6 +9,11 @@ config SRCARCH
 	string
 	option env="SRCARCH"
 
+config WT_COMPILE_FACTORY_VERSION
+	bool "factory version"
+	help
+	  This is factory version
+
 source "arch/$SRCARCH/Kconfig"
 
 source "test/Kconfig"
