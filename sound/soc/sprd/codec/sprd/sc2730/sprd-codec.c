@@ -17,6 +17,7 @@
 #include "sprd-asoc-debug.h"
 #define pr_fmt(fmt) pr_sprd_fmt("SC2730")""fmt
 
+
 #include <linux/atomic.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -749,14 +750,6 @@ static void update_switch(struct snd_soc_codec *codec, u32 path, u32 on)
 
 static inline void sprd_codec_vcm_v_sel(struct snd_soc_codec *codec, int v_sel)
 {
-/* yintang marked for compiling.
- * int mask;
- * int val;
- * sp_asoc_pr_dbg("VCM Set %d\n", v_sel);
- * mask = VB_V_MASK << VB_V;
- * val = (v_sel << VB_V) & mask;
- * snd_soc_update_bits(codec, SOC_REG(ANA_PMU1), mask, val);
- */
 }
 
 /* das dc offset setting */
@@ -1070,7 +1063,6 @@ static void spk_pa_short_check(struct sprd_codec_priv *sprd_codec)
 
 	val = snd_soc_read(codec, SOC_REG(ANA_STS14)) | IMPD_ADC_DATO(0xFFFF);
 
-	/* yintang: TBD. calculate the impd per the val */
 #endif
 }
 
@@ -1404,7 +1396,6 @@ static int sprd_codec_digital_open(struct snd_soc_codec *codec)
 
 	sprd_codec_sdm_init(codec);
 
-	/*peng.lee added this according to janus.li's email*/
 	snd_soc_update_bits(codec, SOC_REG(AUD_SDM_CTL0), 0xFFFF, 0);
 
 	/* Set the left/right clock selection. */
@@ -1428,7 +1419,6 @@ static int sprd_codec_digital_open(struct snd_soc_codec *codec)
 	return ret;
 }
 
-/*yintang marked for compiling*/
 #ifdef SPRD_CODEC_TBD
 static void sprd_codec_irq_oxp_enable(struct snd_soc_codec *codec)
 {
@@ -3494,12 +3484,17 @@ static void pa_short_stat_proc_read(struct snd_info_entry *entry,
 		sprd_codec->cp_short_stat, sprd_codec->pa_short_stat);
 }
 
+#define CANNEL_DUMP_CODEC_REG 0
 static void sprd_codec_proc_read(struct snd_info_entry *entry,
 				 struct snd_info_buffer *buffer)
 {
 	struct sprd_codec_priv *sprd_codec = entry->private_data;
 	struct snd_soc_codec *codec = sprd_codec->codec;
 	int reg, ret;
+
+    #if CANNEL_DUMP_CODEC_REG
+    return;
+    #endif
 
 	ret = agdsp_access_enable();
 	if (ret) {
@@ -4196,7 +4191,6 @@ static int sprd_codec_ana_probe(struct platform_device *pdev)
 	/* Set global register accessing vars for headset. */
 	glb_vars.regmap = adi_rgmp;
 	glb_vars.codec_reg_offset = val;
-	/* yintang: marked for compiling */
 	sprd_headset_set_global_variables(&glb_vars);
 
 	/* Parsing configurations varying as machine. */
