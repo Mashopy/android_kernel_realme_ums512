@@ -1521,21 +1521,10 @@ static int sysdump_panic_event_init(void)
 {
 	/* register sysdump panic notifier */
 	atomic_notifier_chain_register(&panic_notifier_list,
-						&sysdump_panic_event_nb);
+		&sysdump_panic_event_nb);
 	return 0;
 }
-static __init int sysdump_early_init(void)
-{
-	int ret;
-	/* register sysdump panic notifier */
-	sysdump_panic_event_init();
-	/* init kaslr_offset if need */
-	ret = kaslr_info_init();
-	if (ret)
-		pr_emerg("kaslr_info init failed!!!\n");
-	return 0;
-}
-early_initcall(sysdump_early_init);
+early_initcall(sysdump_panic_event_init);
 void sysdump_sysctl_exit(void)
 {
 	if (sysdump_sysctl_hdr)

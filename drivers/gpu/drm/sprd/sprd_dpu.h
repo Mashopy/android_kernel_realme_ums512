@@ -208,6 +208,7 @@ struct sprd_dpu {
 	struct dpu_glb_ops *glb;
 	struct drm_display_mode *mode;
 	struct sprd_dpu_layer *layers;
+	struct sprd_dsi *dsi;
 	u8 pending_planes;
 };
 

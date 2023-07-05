@@ -42,6 +42,13 @@
 #include "shub_protocol.h"
 #include "shub_opcode.h"
 #include <linux/pm_wakeup.h>
+#include <linux/hardware_info.h>
+
+#define MAX_SENSOR_HANDLE 200
+static u8 sensor_status[MAX_SENSOR_HANDLE];
+
+#define MAX_SENSOR_HANDLE 200
+static u8 sensor_status[MAX_SENSOR_HANDLE];
 
 #define MAX_SENSOR_HANDLE 200
 static u8 sensor_status[MAX_SENSOR_HANDLE];
@@ -908,6 +915,7 @@ static ssize_t op_download_show(struct device *dev,
 	struct shub_data *sensor = dev_get_drvdata(dev);
 	u8 data[4];
 	u32 version = 0, i;
+    char firmware_ver[HARDWARE_MAX_ITEM_LONGTH];
 
 	for (i = 0; i < 15; i++) {
 		if (sensor->mcu_mode == SHUB_BOOT) {
@@ -941,6 +949,27 @@ static ssize_t op_download_show(struct device *dev,
 		cancel_delayed_work_sync(&sensor->time_sync_work);
 		queue_delayed_work(sensor->driver_wq,
 				   &sensor->time_sync_work, 0);
+		for(i = 0; i < _HW_SENSOR_TOTAL; i++){
+			if(hw_sensor_id[i].id_status == _IDSTA_OK){
+				if(strstr(hw_sensor_id[i].pname, "accel")){
+					snprintf(firmware_ver, HARDWARE_MAX_ITEM_LONGTH, hw_sensor_id[i].pname+14);
+					dev_err(&sensor->sensor_pdev->dev, "firmware_ver : %s, longth = %d", firmware_ver, HARDWARE_MAX_ITEM_LONGTH);
+					hardwareinfo_set_prop(HARDWARE_ACCELEROMETER, firmware_ver);
+				}else if(strstr(hw_sensor_id[i].pname, "mag")){
+					snprintf(firmware_ver, HARDWARE_MAX_ITEM_LONGTH, hw_sensor_id[i].pname+9);
+					dev_err(&sensor->sensor_pdev->dev, "firmware_ver : %s, longth = %d", firmware_ver, HARDWARE_MAX_ITEM_LONGTH);
+					hardwareinfo_set_prop(HARDWARE_MAGNETOMETER, firmware_ver);
+				}else if(strstr(hw_sensor_id[i].pname, "gyro")){
+					snprintf(firmware_ver, HARDWARE_MAX_ITEM_LONGTH, hw_sensor_id[i].pname+10);
+					dev_err(&sensor->sensor_pdev->dev, "firmware_ver : %s, longth = %d", firmware_ver, HARDWARE_MAX_ITEM_LONGTH);
+					hardwareinfo_set_prop(HARDWARE_GYROSCOPE, firmware_ver);
+				}else if(strstr(hw_sensor_id[i].pname, "light")){
+					snprintf(firmware_ver, HARDWARE_MAX_ITEM_LONGTH, hw_sensor_id[i].pname+6);
+					dev_err(&sensor->sensor_pdev->dev, "firmware_ver : %s, longth = %d", firmware_ver, HARDWARE_MAX_ITEM_LONGTH);
+					hardwareinfo_set_prop(HARDWARE_ALSPS, firmware_ver);
+				}
+			}
+		}
 	}
 
 	return sprintf(buf, "%u\n", version);
@@ -1154,6 +1183,7 @@ static void shub_save_calibration_data(struct work_struct *work)
 		sensor->cal_savests = err;
 	} else {
 		sensor->cal_savests = 0;
+		schedule_work(&sensor->download_cali_data_work);
 	}
 	if (pfile)
 		filp_close(pfile, NULL);
@@ -1471,7 +1501,7 @@ static int set_als_calib_cmd(struct shub_data *sensor, u8 cmd, u8 id)
 		}
 		/*sleep for light senor collect data every 100ms*/
 		msleep(100);
-		pr_debug("shub_sipc_read: ptr[0] = %d\n", ptr[0]);
+		pr_err("shub_sipc_read: ptr[0] = %d\n", ptr[0]);
 		light_sum += ptr[0];
 	}
 	average_als = light_sum / LIGHT_CALI_DATA_COUNT;
@@ -1486,6 +1516,7 @@ static int set_als_calib_cmd(struct shub_data *sensor, u8 cmd, u8 id)
 		als_cali_coef = LIGHT_SENSOR_CALI_VALUE / average_als;
 		status = CALIB_STATUS_PASS;
 	}
+	pr_err("als_cali_coef = %d\n", als_cali_coef);
 	memcpy(als_data, &als_cali_coef, sizeof(als_cali_coef));
 
 	err = shub_save_als_cali_data(sensor, als_data, sizeof(als_data));

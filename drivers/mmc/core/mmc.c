@@ -15,6 +15,8 @@
 #include <linux/slab.h>
 #include <linux/stat.h>
 #include <linux/pm_runtime.h>
+#include <linux/mm.h> 
+
 
 #include <linux/mmc/host.h>
 #include <linux/mmc/card.h>
@@ -667,7 +669,9 @@ static int mmc_decode_ext_csd(struct mmc_card *card, u8 *ext_csd)
 		card->ext_csd.device_life_time_est_typ_b =
 			ext_csd[EXT_CSD_DEVICE_LIFE_TIME_EST_TYP_B];
 	}
-
+#ifdef CONFIG_MMC_SPRD_BOOTDEVICE
+	sprd_bootdevice_csdinfo_get(card);
+#endif
 #if defined(CONFIG_EMMC_SOFTWARE_CQ_SUPPORT)
 	/* eMMC v5.1 or later */
 	if (card->ext_csd.rev >= 8) {
@@ -876,6 +880,172 @@ static ssize_t mmc_dsr_show(struct device *dev,
 
 static DEVICE_ATTR(dsr, S_IRUGO, mmc_dsr_show, NULL);
 
+static int get_dram_size(void)
+{
+    int temp_size;
+    temp_size = (int)totalram_pages/1024; //page size 4K
+
+    if ((temp_size > 0*256) && (temp_size <= 1*256))
+        return 1;
+    else if ((temp_size > 1*256) && (temp_size <= 2*256))
+        return 2;
+    else if ((temp_size > 2*256) && (temp_size <= 3*256))
+        return 3;
+    else if ((temp_size > 3*256) && (temp_size <= 4*256))
+        return 4;
+    else if ((temp_size > 4*256) && (temp_size <= 6*256))
+        return 6;
+    else if ((temp_size > 6*256) && (temp_size <= 8*256))
+        return 8;
+    else
+        return 0;
+}
+
+static int get_emmc_size(struct mmc_card *card)
+{
+    int temp_size;
+    temp_size = (int)card->ext_csd.sectors/2/1024/1024; //sector size 512B
+
+    if ((temp_size > 8) && (temp_size <= 16))
+        return 16;
+    else if ((temp_size > 16) && (temp_size <= 32))
+        return 32;
+    else if ((temp_size > 32) && (temp_size <= 64))
+        return 64;
+    else if ((temp_size > 64) && (temp_size <= 128))
+        return 128;
+    else if ((temp_size > 128) && (temp_size <= 256))
+        return 256;
+    else
+        return 0;
+}
+
+static ssize_t flash_name_show(struct device *dev,
+    struct device_attribute *attr,
+    char *buf)
+{
+    struct mmc_card *card = mmc_dev_to_card(dev);
+    char *vendor_name = NULL;
+    char *emcp_name = NULL;
+
+    switch (card->cid.manfid) {
+        case 0x11:
+            vendor_name = "Toshiba";
+            break;
+        case 0x13:
+            vendor_name = "Micron";
+	        if (strncmp(card->cid.prod_name, "G1J9S9", strlen("G1J9S9")) == 0)
+                emcp_name = "MT29VZZZAD9GQFSM_046W_9S9";
+            else
+                emcp_name = NULL;
+            break;
+        case 0x15:
+            vendor_name = "Samsung";
+	        if (strncmp(card->cid.prod_name, "DP6DAB", strlen("DP6DAB")) == 0)
+                emcp_name = "KMDP6001DA_B425";
+            else if (strncmp(card->cid.prod_name, "DX68MB", strlen("DX68MB")) == 0)
+                emcp_name = "KMDX60018M_B425";
+	        else if (strncmp(card->cid.prod_name, "DV6DAB", strlen("DV6DAB")) == 0)
+                emcp_name = "KMDV6001DA_B620";
+	        else if (strncmp(card->cid.prod_name, "CUTA42", strlen("CUTA42")) == 0)
+                emcp_name = "KLMCG2UCTA_B041";
+	        else
+                emcp_name = NULL;
+            break;
+        case 0x45:
+            vendor_name = "Sandisk";
+            break;
+        case 0x70:
+            vendor_name = "Kingston";
+            break;
+        case 0x6b:
+            vendor_name = "Phison";
+	        if (strncmp(card->cid.prod_name, "MMC64G", strlen("MMC64G")) == 0)
+                emcp_name = "CTE7A0YJ_64GE";
+	        else
+                emcp_name = NULL;
+            break;
+        case 0x90:
+            vendor_name = "Hynix";
+	        if (strncmp(card->cid.prod_name, "hB8aP>", strlen("hB8aP>")) == 0)
+                emcp_name = "H9HP27ADAMADAR_KMM";
+            else if (strncmp(card->cid.prod_name, "hC8aP>", strlen("hC8aP>")) == 0)
+                emcp_name = "H9AG9G5ANBX100";
+            else
+                emcp_name = NULL;
+            break;
+        case 0x9b:
+            vendor_name = "YMTC";
+            if (strncmp(card->cid.prod_name, "Y2P032", strlen("Y2P032")) == 0)
+                emcp_name = "YMEC6A2TB1A2C3";
+            else
+                emcp_name = NULL;
+            break;
+        case 0x8F:
+            vendor_name = "UNIC";
+            break;
+        case 0xF4:
+            vendor_name = "BIWIN";
+            break;
+        case 0x88:
+            vendor_name = "longsys";
+            break;
+        default:
+            vendor_name = "Unknown";
+            break;
+    }
+
+    if (emcp_name == NULL)
+        emcp_name = card->cid.prod_name;
+    return sprintf(buf, "%s_%s_%dGB_%dGB\n",vendor_name, emcp_name, get_dram_size(), get_emmc_size(card));
+}
+static DEVICE_ATTR(flash_name, S_IRUGO, flash_name_show, NULL);
+
+static ssize_t vendor_name_show(struct device *dev,
+    struct device_attribute *attr,
+    char *buf)
+{
+    struct mmc_card *card = mmc_dev_to_card(dev);
+    char *vendor_name = NULL;
+
+    switch (card->cid.manfid) {
+        case 0x11:
+            vendor_name = "Toshiba";
+            break;
+        case 0x13:
+            vendor_name = "Micron";
+            break;
+        case 0x15:
+            vendor_name = "Samsung";
+            break;
+        case 0x45:
+            vendor_name = "Sandisk";
+            break;
+        case 0x70:
+            vendor_name = "Kingston";
+            break;
+        case 0x90:
+            vendor_name = "Hynix";
+            break;
+        case 0x8F:
+            vendor_name = "UNIC";
+            break;
+        case 0xF4:
+            vendor_name = "BIWIN";
+            break;
+        case 0x88:
+            vendor_name = "longsys";
+            break;
+        default:
+            vendor_name = "Unknown";
+            break;
+    }
+
+    return sprintf(buf, "%s\n",vendor_name);
+}
+
+static DEVICE_ATTR(vendor, S_IRUGO, vendor_name_show, NULL);
+
 static struct attribute *mmc_std_attrs[] = {
 	&dev_attr_cid.attr,
 	&dev_attr_csd.attr,
@@ -900,6 +1070,8 @@ static struct attribute *mmc_std_attrs[] = {
 	&dev_attr_ocr.attr,
 	&dev_attr_dsr.attr,
 	&dev_attr_cmdq_en.attr,
+    &dev_attr_flash_name.attr,	
+    &dev_attr_vendor.attr,		
 	NULL,
 };
 ATTRIBUTE_GROUPS(mmc_std);

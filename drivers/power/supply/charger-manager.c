@@ -1,6 +1,5 @@
 /*
  * Copyright (C) 2011 Samsung Electronics Co., Ltd.
- * MyungJoo Ham <myungjoo.ham@samsung.com>
  *
  * This driver enables to monitor battery health and control charger
  * during suspend-to-mem.
@@ -29,6 +28,7 @@
 #include <linux/sysfs.h>
 #include <linux/of.h>
 #include <linux/thermal.h>
+#include <linux/hardware_info.h>
 
 /*
  * Default termperature threshold for charging.
@@ -37,7 +37,7 @@
 #define CM_DEFAULT_RECHARGE_TEMP_DIFF	50
 #define CM_DEFAULT_CHARGE_TEMP_MAX	500
 #define CM_CAP_CYCLE_TRACK_TIME		15
-#define CM_UVLO_OFFSET			50000
+#define CM_UVLO_OFFSET			100000
 #define CM_FORCE_SET_FUEL_CAP_FULL	1000
 #define CM_LOW_TEMP_REGION		100
 #define CM_LOW_TEMP_SHUTDOWN_VALTAGE	3200000
@@ -70,7 +70,12 @@
 #define CM_FAST_CHARGE_ENABLE_COUNT		2
 #define CM_FAST_CHARGE_DISABLE_COUNT		2
 
-#define CM_TRACK_FILE_PATH "/mnt/vendor/battery/calibration_data/.battery_file"
+#define CM_HIGH_TEMP_NOTIFY			550
+
+#define JEITA_HIGHEST_TEMPE     530
+#define JEITA_LOWEST_TEMPE      (-20)
+
+#define CM_TRACK_FILE_PATH "/mnt/vendor/battery/calibration_data/.battery_track_file"
 
 static const char * const default_event_names[] = {
 	[CM_EVENT_UNKNOWN] = "Unknown",
@@ -145,6 +150,85 @@ static void cm_notify_type_handle(struct charger_manager *cm, enum cm_event_type
 static bool cm_manager_adjust_current(struct charger_manager *cm, int jeita_status);
 static void cm_update_charger_type_status(struct charger_manager *cm);
 static int cm_manager_get_jeita_status(struct charger_manager *cm, int cur_temp);
+static int cm_manager_step_charge_monitor(struct charger_manager *cm);
+
+
+
+static int cm_battery_status = 0;
+static int enable_charger_arr[OTHERS_MAX] = {0};
+
+static int shutdown_low_volt_count = 0;
+static int shutdown_low_cap_count = 0;
+static int ui_cap;
+
+static void set_batt_charge_status(int user, int status, int enable)
+{
+	if (enable) {
+		cm_battery_status &= ~status;
+	} else {
+		cm_battery_status |= status;
+	}
+
+	enable_charger_arr[user] = !enable;
+}
+
+static int get_en_charge_state()
+{
+	int i;
+	int val = 0;
+
+	for (i = 0; i < OTHERS_MAX; i++) {
+		val |= enable_charger_arr[i];
+	}
+
+	return !val; // 0:disable 1:enable
+}
+
+/**
+ * stop charge alaways display icon
+ */
+static void cm_enable_charge()
+{
+	int val = 0;
+
+	val = get_en_charge_state();
+	charger_dev_enalbe_charger(val);
+}
+
+static void cm_uevent_notify(struct charger_manager *cm)
+{
+	int ret;
+	char *env[2] = { "CHGSTAT=1", NULL };
+
+	dev_info(cm->dev, "%s :0x%x\n", __func__, cm_battery_status);
+	ret = kobject_uevent_env(&cm->dev->kobj, KOBJ_CHANGE, env);
+	if (ret) {
+		dev_err(cm->dev, "%s :kobject_uevent_env fail!!\n", __func__);
+	}
+}
+
+static void get_battery_brand(struct charger_manager *cm)
+{
+	int bat_id, err;
+	struct device_node *battery_np;
+
+	bat_id = get_battery_id();
+	dev_err(cm->dev, "[%s] bat_id = %d\n", __func__, bat_id);
+	battery_np = of_parse_phandle(cm->dev->of_node, "monitored-battery", bat_id);
+	if(!battery_np) {
+		cm->brand = "non_standard_battery";
+		dev_err(cm->dev, "[%s] get monitored-battery fail, cm->brand = %s\n", __func__, cm->brand);
+		return ;
+	}
+
+	err = of_property_read_string(battery_np, "brand", &cm->brand);
+	if(err) {
+		dev_err(cm->dev, "[%s]get_brand fail\n", __func__);
+		cm->brand = "non_standard_battery";
+	}
+
+	dev_err(cm->dev, "[%s] get_battery_brand successful, cm->brand = %s\n", __func__, cm->brand);
+}
 
 static int __init boot_calibration_mode(char *str)
 {
@@ -403,14 +487,14 @@ static bool is_ext_pwr_online(struct charger_manager *cm)
 }
 
  /**
-  * get_batt_uA - Get the current level of the battery
+  * get_ibat_avg_uA - Get the current level of the battery
   * @cm: the Charger Manager representing the battery.
   * @uA: the current level returned.
   *
   * Returns 0 if there is no error.
   * Returns a negative value on error.
   */
-static int get_batt_uA(struct charger_manager *cm, int *uA)
+static int get_ibat_avg_uA(struct charger_manager *cm, int *uA)
 {
 	union power_supply_propval val;
 	struct power_supply *fuel_gauge;
@@ -431,14 +515,14 @@ static int get_batt_uA(struct charger_manager *cm, int *uA)
 }
 
  /**
-  * get_batt_cur_now - Get the current level of the battery
+  * get_ibat_now_uA - Get the current level of the battery
   * @cm: the Charger Manager representing the battery.
   * @uA: the current level returned.
   *
   * Returns 0 if there is no error.
   * Returns a negative value on error.
   */
-static int get_batt_cur_now(struct charger_manager *cm, int *uA)
+static int get_ibat_now_uA(struct charger_manager *cm, int *uA)
 {
 	union power_supply_propval val;
 	struct power_supply *fuel_gauge;
@@ -458,16 +542,35 @@ static int get_batt_cur_now(struct charger_manager *cm, int *uA)
 	return 0;
 }
 
+static bool is_batt_first_poweron(struct charger_manager *cm)
+{
+	union power_supply_propval val;
+	struct power_supply *fuel_gauge;
+	int ret;
+
+	fuel_gauge = power_supply_get_by_name(cm->desc->psy_fuel_gauge);
+	if (!fuel_gauge)
+		return -ENODEV;
+
+	ret = power_supply_get_property(fuel_gauge,
+					POWER_SUPPLY_PROP_IS_FIRST_POWERON, &val);
+	power_supply_put(fuel_gauge);
+	if (ret)
+		return ret;
+
+	return val.intval;
+}
+
 /**
  *
- * get_batt_uV - Get the voltage level of the battery
+ * get_vbat_avg_uV - Get the voltage level of the battery
  * @cm: the Charger Manager representing the battery.
  * @uV: the voltage level returned.
  *
  * Returns 0 if there is no error.
  * Returns a negative value on error.
  */
-static int get_batt_uV(struct charger_manager *cm, int *uV)
+static int get_vbat_avg_uV(struct charger_manager *cm, int *uV)
 {
 	union power_supply_propval val;
 	struct power_supply *fuel_gauge;
@@ -516,7 +619,7 @@ static int get_batt_ocv(struct charger_manager *cm, int *ocv)
 }
 
 /*
- * get_batt_now - Get the battery voltage now
+ * get_vbat_now_uV - Get the battery voltage now
  * level of the battery.
  * @cm: the Charger Manager representing the battery.
  * @uV: the voltage level returned.
@@ -524,7 +627,7 @@ static int get_batt_ocv(struct charger_manager *cm, int *ocv)
  * Returns 0 if there is no error.
  * Returns a negative value on error.
  */
-static int get_batt_vol_now(struct charger_manager *cm, int *ocv)
+static int get_vbat_now_uV(struct charger_manager *cm, int *ocv)
 {
 	union power_supply_propval val;
 	struct power_supply *fuel_gauge;
@@ -1011,11 +1114,11 @@ static bool is_full_charged(struct charger_manager *cm)
 
 	/* Full, if it's over the fullbatt voltage */
 	if (desc->fullbatt_uV > 0 && desc->fullbatt_uA > 0) {
-		ret = get_batt_uV(cm, &uV);
+		ret = get_vbat_now_uV(cm, &uV);
 		if (ret)
 			goto out;
 
-		ret = get_batt_uA(cm, &uA);
+		ret = get_ibat_now_uA(cm, &uA);
 		if (ret)
 			goto out;
 
@@ -1249,13 +1352,13 @@ static int cm_fast_charge_enable_check(struct charger_manager *cm)
 	if (!desc->is_fast_charge || desc->enable_fast_charge)
 		return 0;
 
-	ret = get_batt_uV(cm, &batt_uV);
+	ret = get_vbat_now_uV(cm, &batt_uV);
 	if (ret) {
 		dev_err(cm->dev, "failed to get batt uV\n");
 		return ret;
 	}
 
-	ret = get_batt_uA(cm, &batt_uA);
+	ret = get_ibat_now_uA(cm, &batt_uA);
 	if (ret) {
 		dev_err(cm->dev, "failed to get batt uA\n");
 		return ret;
@@ -1330,7 +1433,7 @@ static int cm_fast_charge_enable_check(struct charger_manager *cm)
 			cm_manager_get_jeita_status(cm, cm->desc->temperature);
 
 		if (desc->jeita_disabled)
-			cur_jeita_status = STATUS_T1_TO_T2;
+			cur_jeita_status = cm->desc->force_jeita_status;
 
 		cm_manager_adjust_current(cm, cur_jeita_status);
 	}
@@ -1396,7 +1499,7 @@ static int cm_fast_charge_disable(struct charger_manager *cm)
 			cm_manager_get_jeita_status(cm, desc->temperature);
 
 		if (desc->jeita_disabled)
-			cur_jeita_status = STATUS_T1_TO_T2;
+			cur_jeita_status = cm->desc->force_jeita_status;
 
 		cm_manager_adjust_current(cm, cur_jeita_status);
 	}
@@ -1413,13 +1516,13 @@ static int cm_fast_charge_disable_check(struct charger_manager *cm)
 	if (!cm->desc->enable_fast_charge)
 		return 0;
 
-	ret = get_batt_uV(cm, &batt_uV);
+	ret = get_vbat_now_uV(cm, &batt_uV);
 	if (ret) {
 		dev_err(cm->dev, "failed to get batt uV\n");
 		return ret;
 	}
 
-	ret = get_batt_uA(cm, &batt_uA);
+	ret = get_ibat_now_uA(cm, &batt_uA);
 	if (ret) {
 		dev_err(cm->dev, "failed to get batt uA\n");
 		return ret;
@@ -1515,6 +1618,8 @@ static int try_fast_charger_enable(struct charger_manager *cm, bool enable)
 static int try_charger_enable(struct charger_manager *cm, bool enable)
 {
 	int err = 0;
+	struct timespec64 now_time;
+
 	try_fast_charger_enable(cm, enable);
 
 	/* Ignore if it's redundant command */
@@ -1536,6 +1641,8 @@ static int try_charger_enable(struct charger_manager *cm, bool enable)
 		 * Save start time of charging to limit
 		 * maximum possible charging time.
 		 */
+		now_time = ktime_to_timespec64(ktime_get_boottime());
+		cm->desc->charger_safety_time = now_time.tv_sec;
 		cm->charging_start_time = ktime_to_ms(ktime_get());
 		cm->charging_end_time = 0;
 
@@ -1545,6 +1652,7 @@ static int try_charger_enable(struct charger_manager *cm, bool enable)
 		 * Save end time of charging to maintain fully charged state
 		 * of battery after full-batt.
 		 */
+		cm->desc->charger_safety_time = 0;
 		cm->charging_start_time = 0;
 		cm->charging_end_time = ktime_to_ms(ktime_get());
 
@@ -1821,6 +1929,8 @@ static int cm_check_charge_voltage(struct charger_manager *cm)
 	struct power_supply *fuel_gauge;
 	union power_supply_propval val;
 	int ret, charge_vol;
+	int charge_voltage_offset = CHG_VOL_OFFSET;
+	int batt_uA = 0;
 
 	if (!desc->charge_voltage_max || !desc->charge_voltage_drop)
 		return -EINVAL;
@@ -1842,9 +1952,22 @@ static int cm_check_charge_voltage(struct charger_manager *cm)
 
 	charge_vol = val.intval;
 
-	if (cm->charger_enabled && charge_vol > desc->charge_voltage_max) {
-		dev_info(cm->dev, "Charging voltage is larger than %d\n",
-			 desc->charge_voltage_max);
+	ret = get_ibat_now_uA(cm, &batt_uA);
+	if (ret) {
+		dev_err(cm->dev, "failed to get batt uA\n");
+		return ret;
+	}
+
+	if (batt_uA > 0)
+		charge_voltage_offset += batt_uA * CHG_LINE_IMPEDANCE / 1000;
+
+	if (charge_voltage_offset > CHG_VOL_OFFSET_MAX)
+		charge_voltage_offset = CHG_VOL_OFFSET_MAX;
+
+	if (cm->charger_enabled && (charge_vol > (desc->charge_voltage_max - charge_voltage_offset))) {
+		cm_battery_status |= CM_VBUS_OVP_STATUS;
+		dev_info(cm->dev, "Charging voltage is larger than %d, charge_vol = %d, offset = %d\n",
+			 desc->charge_voltage_max, charge_vol, charge_voltage_offset);
 		uevent_notify(cm, "Discharging");
 		try_charger_enable(cm, false);
 		cm->charging_status |= CM_CHARGE_VOLTAGE_ABNORMAL;
@@ -1853,6 +1976,7 @@ static int cm_check_charge_voltage(struct charger_manager *cm)
 	} else if (is_ext_pwr_online(cm) && !cm->charger_enabled &&
 		   charge_vol <= (desc->charge_voltage_max - desc->charge_voltage_drop) &&
 		   (cm->charging_status & CM_CHARGE_VOLTAGE_ABNORMAL)) {
+		cm_battery_status &= ~CM_VBUS_OVP_STATUS;
 		dev_info(cm->dev, "Charging voltage is less than %d, recharging\n",
 			 desc->charge_voltage_max - desc->charge_voltage_drop);
 		uevent_notify(cm, "Recharging");
@@ -1982,12 +2106,6 @@ static bool cm_manager_adjust_current(struct charger_manager *cm,
 	term_volt = desc->jeita_tab[jeita_status].term_volt;
 	target_cur = desc->jeita_tab[jeita_status].current_ua;
 
-	if (cm->desc->thm_adjust_cur >= 0 &&
-	    cm->desc->thm_adjust_cur < target_cur) {
-		target_cur = cm->desc->thm_adjust_cur;
-		dev_info(cm->dev, "thermel current is less than jeita current\n");
-	}
-
 	dev_info(cm->dev, "target terminate voltage = %d, target current = %d\n",
 		 term_volt, target_cur);
 
@@ -2027,7 +2145,11 @@ static bool cm_manager_adjust_current(struct charger_manager *cm,
 	if (ret)
 		return false;
 
-	try_charger_enable(cm, true);
+	if (get_en_charge_state()) {
+		try_charger_enable(cm, true);
+        } else {
+		dev_err(cm->dev, "%s: other user stop charge jeita can not start charge\n", __func__);
+        }
 	cm->charging_status &= ~(CM_CHARGE_TEMP_OVERHEAT | CM_CHARGE_TEMP_COLD);
 	return true;
 }
@@ -2036,7 +2158,7 @@ static int cm_manager_get_jeita_status(struct charger_manager *cm, int cur_temp)
 {
 	struct charger_desc *desc = cm->desc;
 	static int jeita_status;
-	int i;
+	int i, temp_status;
 
 	for (i = desc->jeita_tab_size - 1; i >= 0; i--) {
 		if ((cur_temp >= desc->jeita_tab[i].temp && i > 0) ||
@@ -2045,35 +2167,45 @@ static int cm_manager_get_jeita_status(struct charger_manager *cm, int cur_temp)
 		}
 	}
 
-	switch (i) {
-	case 3:
-		jeita_status = STATUS_ABOVE_T3;
-		break;
+	temp_status = i + 1;
 
-	case 2:
-		if (jeita_status != STATUS_ABOVE_T3 ||
-		    cur_temp <= desc->jeita_tab[3].recovery_temp)
-			jeita_status = STATUS_T2_TO_T3;
-		break;
-
-	case 1:
-		if ((jeita_status != STATUS_T2_TO_T3 ||
-		     cur_temp <= desc->jeita_tab[2].recovery_temp) &&
-		    (jeita_status != STATUS_T0_TO_T1 ||
-		     cur_temp >= desc->jeita_tab[1].recovery_temp))
-			jeita_status = STATUS_T1_TO_T2;
-		break;
-
-	case 0:
-		if (jeita_status != STATUS_BELOW_T0 ||
-		    cur_temp >= desc->jeita_tab[0].recovery_temp)
-			jeita_status = STATUS_T0_TO_T1;
-		break;
-
-	default:
-		jeita_status = STATUS_BELOW_T0;
-		break;
+	if (temp_status == desc->jeita_tab_size) {
+		jeita_status = desc->jeita_tab_size;
+	} else if (temp_status == 0) {
+		jeita_status = 0;
+	} else {
+		/* temperature goes down */
+		if (jeita_status > temp_status) {
+			/* if temp > recovery_temp, we should check cur_temp and recovery_temp */
+			if ((jeita_status - temp_status) > 1) {
+				jeita_status = temp_status + 1;
+			} else if (desc->jeita_tab[i + 1].temp > desc->jeita_tab[i + 1].recovery_temp) {
+				if (cur_temp < desc->jeita_tab[i + 1].recovery_temp)
+					jeita_status = temp_status;
+			} else if (desc->jeita_tab[i + 1].temp < desc->jeita_tab[i + 1].recovery_temp) {
+					jeita_status = temp_status;
+			}
+		/* temperature goes up */
+		} else if (jeita_status < temp_status) {
+			/* if temp < recovery_temp, we should check cur_temp and recovery_temp */
+			if ((temp_status - jeita_status) > 1) {
+				jeita_status = temp_status - 1;
+			} else if (desc->jeita_tab[i].temp < desc->jeita_tab[i].recovery_temp) {
+				if (cur_temp > desc->jeita_tab[i].recovery_temp)
+					jeita_status = temp_status;
+			} else if (desc->jeita_tab[i].temp > desc->jeita_tab[i].recovery_temp) {
+				jeita_status = temp_status;
+			}
+		}
 	}
+
+	if (jeita_status > desc->jeita_tab_size)
+		jeita_status = desc->jeita_tab_size;
+	else if (jeita_status < 0)
+		jeita_status = 0;
+
+	dev_info(cm->dev, "%s:line%d: i:%d, current-temp jeita status:%d-%d, current-temp:%d\n",
+		 __func__, __LINE__, i, jeita_status, temp_status, cur_temp);
 
 	return jeita_status;
 }
@@ -2096,9 +2228,10 @@ static int cm_manager_jeita_current_monitor(struct charger_manager *cm)
 	}
 
 	if (desc->jeita_disabled) {
-		if (last_jeita_status != STATUS_T1_TO_T2) {
-			dev_info(cm->dev, "Disable jeita and force jeita state to STATUS_T1_TO_T2\n");
-			last_jeita_status = STATUS_T1_TO_T2;
+		if (last_jeita_status != cm->desc->force_jeita_status) {
+			dev_info(cm->dev, "Disable jeita and force jeita state to status:%d\n",
+				 cm->desc->force_jeita_status);
+			last_jeita_status = cm->desc->force_jeita_status;
 			desc->thm_adjust_cur = -EINVAL;
 			cm_manager_adjust_current(cm, last_jeita_status);
 		}
@@ -2149,6 +2282,80 @@ out:
 	return 0;
 }
 
+static int cm_manager_step_charge_monitor(struct charger_manager *cm)
+{
+	int step_chg_cur, step_chg_volt, batt_uV;
+	union power_supply_propval val;
+	struct power_supply *psy;
+	int jeita_status;
+	int ret, i;
+
+	if (!cm->desc->jeita_tab_size)
+		return 0;
+
+	if (!is_ext_pwr_online(cm))
+		return 0;
+
+	jeita_status = cm_manager_get_jeita_status(cm, cm->desc->temperature);
+
+	ret = get_vbat_now_uV(cm, &batt_uV);
+	if (ret) {
+		dev_err(cm->dev, "get_batt_ocV error.\n");
+		return ret;
+	}
+
+	step_chg_cur = cm->desc->jeita_tab[jeita_status].step_chg_cur;
+	step_chg_volt = cm->desc->jeita_tab[jeita_status].step_chg_volt;
+
+	if (batt_uV > step_chg_volt)
+		step_chg_cur = cm->desc->jeita_tab[jeita_status].current_ua;
+
+	for (i = 0; cm->desc->psy_charger_stat[i]; i++) {
+		psy = power_supply_get_by_name(cm->desc->psy_charger_stat[i]);
+		if (!psy) {
+			dev_err(cm->dev, "Cannot find power supply \"%s\"\n",
+				cm->desc->psy_charger_stat[i]);
+			continue;
+		}
+
+		val.intval = step_chg_cur;
+		ret = power_supply_set_property(psy,
+						POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
+						&val);
+		power_supply_put(psy);
+		if (ret) {
+			dev_err(cm->dev, "failed to set charge current, ret = %d\n", ret);
+			continue;
+		}
+	}
+
+	return ret;
+}
+
+#ifdef CONFIG_WT_COMPILE_FACTORY_VERSION
+static void cm_ato_control_charge(struct charger_manager *cm, int fuel_cap)
+{
+	dev_info(cm->dev, "[%s] fuel_cap = %d\n", __func__, fuel_cap);
+	if (fuel_cap > 650) {
+		set_batt_charge_status(ATO_SET, CM_ATO_CHARGE_STATUS, 0);
+		dev_info(cm->dev, "[%s] cap > 65 stop charger\n", __func__);
+		uevent_notify(cm, default_event_names[CM_EVENT_CHG_START_STOP]);
+		try_charger_enable(cm, false);
+		power_supply_changed(cm->charger_psy);
+	} else if ((fuel_cap < 500) && (cm_battery_status & CM_ATO_CHARGE_STATUS)) {
+		set_batt_charge_status(ATO_SET, CM_ATO_CHARGE_STATUS, 1);
+		if (get_en_charge_state()) {
+			dev_info(cm->dev, "[%s] cap < 50 start charger\n", __func__);
+			try_charger_enable(cm, true);
+			power_supply_changed(cm->charger_psy);
+		} else {
+			set_batt_charge_status(ATO_SET, CM_ATO_CHARGE_STATUS, 0);
+			dev_err(cm->dev, "[%s] start charge fail, other user stop charge\n", __func__);
+		}
+	}
+}
+#endif
+
 /**
  * _cm_monitor - Monitor the temperature and return true for exceptions.
  * @cm: the Charger Manager representing the battery.
@@ -2160,6 +2367,8 @@ static bool _cm_monitor(struct charger_manager *cm)
 {
 	int temp_alrt, ret;
 	int i;
+	u64 diff_time;
+	struct timespec64 now_time;
 
 	/* Feed the charger watchdog if necessary */
 	ret = cm_feed_watchdog(cm);
@@ -2167,6 +2376,11 @@ static bool _cm_monitor(struct charger_manager *cm)
 		dev_warn(cm->dev, "Failed to feed charger watchdog\n");
 		return false;
 	}
+
+	now_time = ktime_to_timespec64(ktime_get_boottime());
+	diff_time = now_time.tv_sec - cm->desc->charger_safety_time;
+	if (diff_time > 0)
+		set_charge_safety_timer(diff_time);
 
 	for (i = 0; i < cm->desc->num_charger_regulators; i++) {
 		if (cm->desc->charger_regulators[i].externally_control) {
@@ -2193,6 +2407,16 @@ static bool _cm_monitor(struct charger_manager *cm)
 	if (ret) {
 		dev_warn(cm->dev,
 			 "Errors orrurs when adjusting charging current\n");
+		return false;
+	}
+
+	ret = cm_manager_step_charge_monitor(cm);
+	if (ret)
+		dev_warn(cm->dev,
+			 "Errors orrurs when adjusting step charging current\n");
+
+	if (!get_en_charge_state()) {
+		dev_info(cm->dev, "charge been stop to user\n");
 		return false;
 	}
 
@@ -2245,8 +2469,6 @@ static bool _cm_monitor(struct charger_manager *cm)
 		uevent_notify(cm, default_event_names[CM_EVENT_BATT_FULL]);
 
 		try_charger_enable(cm, false);
-
-		fullbatt_vchk(&cm->fullbatt_vchk_work.work);
 	} else {
 		cm->emergency_stop = 0;
 		cm->charging_status = 0;
@@ -2510,7 +2732,7 @@ static void misc_event_handler(struct charger_manager *cm,
 
 	cm->desc->thm_adjust_cur = -EINVAL;
 
-	if (is_ext_pwr_online(cm)) {
+	if (is_ext_pwr_online(cm) && !(cm_battery_status & CM_AGING_CHARGE_STATUS)) {
 		try_charger_enable(cm, true);
 		ret = get_charger_type(cm, &cm->desc->charger_type);
 		if (ret)
@@ -2595,6 +2817,7 @@ static int wireless_get_property(struct power_supply *psy, enum power_supply_pro
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_ONLINE:
+		dev_info(&psy->dev, "wireless_online = %d\n", data->WIRELESS_ONLINE);
 		val->intval = data->WIRELESS_ONLINE;
 		break;
 	default:
@@ -2613,6 +2836,7 @@ static int ac_get_property(struct power_supply *psy, enum power_supply_property 
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_ONLINE:
+		dev_info(&psy->dev, "ac_online = %d\n", data->AC_ONLINE);
 		val->intval = data->AC_ONLINE;
 		break;
 	default:
@@ -2631,7 +2855,17 @@ static int usb_get_property(struct power_supply *psy, enum power_supply_property
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_ONLINE:
+		dev_info(&psy->dev, "usb_online = %d\n", data->USB_ONLINE);
 		val->intval = data->USB_ONLINE;
+		break;
+	case POWER_SUPPLY_PROP_REAL_TYPE:
+		power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE,
+						val);
+		if (val->intval == 1) {
+			val->strval = "USB";
+		} else if (val->intval == 0) {
+			val->strval = "AC";
+		}
 		break;
 	default:
 		ret = -EINVAL;
@@ -2640,6 +2874,12 @@ static int usb_get_property(struct power_supply *psy, enum power_supply_property
 
 	return ret;
 }
+
+void charger_set_fchg_status(bool val)
+{
+	return;
+}
+EXPORT_SYMBOL(charger_set_fchg_status);
 
 static int charger_get_property(struct power_supply *psy,
 		enum power_supply_property psp,
@@ -2651,13 +2891,14 @@ static int charger_get_property(struct power_supply *psy,
 	int chg_cur = 0;
 	int ret = 0;
 	int i;
+	 int batt_uV;
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 		if (is_charging(cm)) {
 			val->intval = POWER_SUPPLY_STATUS_CHARGING;
 		} else if (is_ext_pwr_online(cm)) {
-			if (is_full_charged(cm) || cm->desc->force_set_full)
+			if (is_full_charged(cm))
 				val->intval = POWER_SUPPLY_STATUS_FULL;
 			else
 				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
@@ -2684,22 +2925,17 @@ static int charger_get_property(struct power_supply *psy,
 			val->intval = 0;
 		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_AVG:
-		ret = get_batt_uV(cm, &val->intval);
-		break;
-	case POWER_SUPPLY_PROP_CURRENT_AVG:
-		fuel_gauge = power_supply_get_by_name(cm->desc->psy_fuel_gauge);
-		if (!fuel_gauge) {
-			ret = -ENODEV;
-			break;
-		}
-		ret = power_supply_get_property(fuel_gauge,
-				POWER_SUPPLY_PROP_CURRENT_AVG, val);
+		ret = get_vbat_avg_uV(cm, &val->intval);
 		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		ret = get_batt_vol_now(cm, &val->intval);
+		ret = get_vbat_now_uV(cm, &val->intval);
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_AVG:
+		ret = get_ibat_avg_uA(cm, &val->intval);
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
-		ret = get_batt_cur_now(cm, &val->intval);
+		ret = get_ibat_now_uA(cm, &val->intval);
+		val->intval = -val->intval;
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		val->intval = cm->desc->temperature;
@@ -2715,8 +2951,13 @@ static int charger_get_property(struct power_supply *psy,
 		val->intval = DIV_ROUND_CLOSEST(cm->desc->cap, 10);
 		if (val->intval > 100)
 			val->intval = 100;
+#ifdef CONFIG_WT_COMPILE_FACTORY_VERSION
+		else if (val->intval < 5)
+			val->intval = 4;
+#else
 		else if (val->intval < 0)
 			val->intval = 0;
+#endif
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
 		if (!is_batt_present(cm)) {
@@ -2724,6 +2965,7 @@ static int charger_get_property(struct power_supply *psy,
 			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
 			break;
 		}
+		ret = get_vbat_now_uV(cm, &batt_uV);
 		val->intval = DIV_ROUND_CLOSEST(cm->desc->cap, 10);
 		if (val->intval > 100)
 			val->intval = 100;
@@ -2738,6 +2980,8 @@ static int charger_get_property(struct power_supply *psy,
 			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
 		else if (val->intval > CM_CAPACITY_LEVEL_CRITICAL)
 			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
+		else if (is_charging(cm) && batt_uV > 3300000)
+			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
 		else
 			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
 		break;
@@ -2905,6 +3149,39 @@ static int charger_get_property(struct power_supply *psy,
 
 		break;
 
+	case POWER_SUPPLY_PROP_STARTCHARGING_TEST:
+		set_batt_charge_status(AGING_SET, CM_AGING_CHARGE_STATUS, 1);
+		if (get_en_charge_state()) {
+			dev_err(cm->dev, "[%s] POWER_SUPPLY_PROP_STARTCHARGING_TEST\n", __func__);
+			try_charger_enable(cm, true);
+		} else {
+			dev_err(cm->dev, "[%s] POWER_SUPPLY_PROP_STARTCHARGING_TEST, start charge fail, other user stop charge\n", __func__);
+		}
+		power_supply_changed(cm->charger_psy);
+		val->intval = 1;
+		break;
+	case POWER_SUPPLY_PROP_STOPCHARGING_TEST:
+		set_batt_charge_status(AGING_SET, CM_AGING_CHARGE_STATUS, 0);
+		try_charger_enable(cm, false);
+		power_supply_changed(cm->charger_psy);
+		val->intval = 0;
+		dev_err(cm->dev, "[%s] POWER_SUPPLY_PROP_STOPCHARGING_TEST\n", __func__);
+		break;
+
+	case POWER_SUPPLY_PROP_BRAND:
+		val->strval = cm->brand;
+		dev_err(cm->dev, "[%s] val->strval = %s\n", __func__, val->strval);
+		break;
+
+	case POWER_SUPPLY_PROP_BATTERY_STATUS_NODE:
+		val->intval = cm_battery_status;
+		dev_info(cm->dev, "get battery status val->strval = %d\n", val->intval);
+		break;
+
+	case POWER_SUPPLY_PROP_SET_SHIP_MODE:
+		val->intval = 0;
+		break;
+
 	default:
 		return -EINVAL;
 	}
@@ -2920,7 +3197,6 @@ charger_set_property(struct power_supply *psy,
 {
 	struct charger_manager *cm = power_supply_get_drvdata(psy);
 	union power_supply_propval thermal_val;
-	int cur_jeita_status;
 	int ret = 0;
 	int i;
 
@@ -3001,26 +3277,14 @@ charger_set_property(struct power_supply *psy,
 				else
 					break;
 			}
-
-			if (cm->desc->jeita_tab_size) {
-				cur_jeita_status = cm_manager_get_jeita_status(cm, cm->desc->temperature);
-				if (val->intval > cm->desc->jeita_tab[cur_jeita_status].current_ua)
-					thermal_val.intval = cm->desc->jeita_tab[cur_jeita_status].current_ua;
-			}
-
-			ret = power_supply_set_property(psy,
-							POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
-							(const union power_supply_propval *)&thermal_val);
-			if (!ret) {
-				power_supply_put(psy);
-				if (cm->desc->enable_fast_charge &&
-				    cm->desc->psy_charger_stat[1])
-					continue;
-				else
-					break;
-			}
 		}
 		break;
+
+        case POWER_SUPPLY_PROP_SET_SHIP_MODE:
+		if (val->intval == 0)
+			charger_set_ship_mode();
+                dev_info(cm->dev, "[%s] set ship mode to %d\n", __func__, val->intval);
+                break;
 
 	default:
 		ret = -EINVAL;
@@ -3038,6 +3302,7 @@ static int charger_property_is_writeable(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+	case POWER_SUPPLY_PROP_SET_SHIP_MODE:
 		ret = 1;
 		break;
 
@@ -3059,6 +3324,7 @@ static enum power_supply_property ac_props[] = {
 
 static enum power_supply_property usb_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
+	POWER_SUPPLY_PROP_REAL_TYPE,
 };
 
 static enum power_supply_property default_charger_props[] = {
@@ -3080,6 +3346,11 @@ static enum power_supply_property default_charger_props[] = {
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT,
 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
 	POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
+	POWER_SUPPLY_PROP_BRAND,
+	POWER_SUPPLY_PROP_STARTCHARGING_TEST,
+	POWER_SUPPLY_PROP_STOPCHARGING_TEST,
+	POWER_SUPPLY_PROP_BATTERY_STATUS_NODE,
+	POWER_SUPPLY_PROP_SET_SHIP_MODE,
 	/*
 	 * Optional properties are:
 	 * POWER_SUPPLY_PROP_CHARGE_NOW,
@@ -3410,7 +3681,7 @@ static ssize_t charger_stop_store(struct device *dev,
 		= container_of(attr, struct charger_regulator,
 					attr_stop_charge);
 	struct charger_manager *cm = charger->cm;
-	int stop_charge, ret;
+	int stop_charge, ret, val;
 
 	ret = sscanf(buf, "%d", &stop_charge);
 	if (!ret)
@@ -3420,13 +3691,20 @@ static ssize_t charger_stop_store(struct device *dev,
 		return -EINVAL;
 
 	if (!stop_charge) {
-		ret = try_charger_enable(cm, true);
-		if (ret) {
-			dev_err(cm->dev, "failed to start charger.\n");
-			return ret;
+		set_batt_charge_status(FRAMEWORK_SET, CM_STOP_CHARGE_NODE_STATUS, 1);
+		val = get_en_charge_state();
+		if (val) {
+			ret = try_charger_enable(cm, true);
+			if (ret) {
+				dev_err(cm->dev, "failed to start charger.\n");
+				return ret;
+			}
+		} else {
+			dev_err(cm->dev, "failed to start charger, other user stop charge\n");
 		}
 		charger->externally_control = false;
 	} else {
+		set_batt_charge_status(FRAMEWORK_SET, CM_STOP_CHARGE_NODE_STATUS, 0);
 		ret = try_charger_enable(cm, false);
 		if (ret) {
 			dev_err(cm->dev, "failed to stop charger.\n");
@@ -3647,10 +3925,10 @@ static int cm_init_thermal_data(struct charger_manager *cm,
 
 static int cm_parse_jeita_table(struct charger_desc *desc,
 				struct device *dev,
+				struct device_node *np,
 				const char *np_name,
 				struct charger_jeita_table **cur_table)
 {
-	struct device_node *np = dev->of_node;
 	struct charger_jeita_table *table;
 	const __be32 *list;
 	int i, size;
@@ -3659,7 +3937,10 @@ static int cm_parse_jeita_table(struct charger_desc *desc,
 	if (!list || !size)
 		return 0;
 
-	desc->jeita_tab_size = size / (4 * sizeof(__be32));
+	desc->jeita_tab_size = size / (sizeof(struct charger_jeita_table) /
+				       sizeof(int) * sizeof(__be32));
+
+	dev_info(dev, "%s, jeita_tab_size = %d\n", __func__, desc->jeita_tab_size);
 	table = devm_kzalloc(dev, sizeof(struct charger_jeita_table) *
 				(desc->jeita_tab_size + 1), GFP_KERNEL);
 	if (!table)
@@ -3670,6 +3951,13 @@ static int cm_parse_jeita_table(struct charger_desc *desc,
 		table[i].recovery_temp = be32_to_cpu(*list++) - 1000;
 		table[i].current_ua = be32_to_cpu(*list++);
 		table[i].term_volt = be32_to_cpu(*list++);
+		table[i].step_chg_cur = be32_to_cpu(*list++);
+		table[i].step_chg_volt = be32_to_cpu(*list++);
+		dev_info(dev, "[%s] %s: temp = %d, rec_temp = %d, cur_ua = %d, term_volt = %d, "
+			 "step_chg_cur = %d, step_chg_volt = %d\n", __func__, np_name,
+			 table[i].temp, table[i].recovery_temp,
+			 table[i].current_ua, table[i].term_volt,
+			 table[i].step_chg_cur, table[i].step_chg_volt);
 	}
 	*cur_table = table;
 
@@ -3679,12 +3967,23 @@ static int cm_parse_jeita_table(struct charger_desc *desc,
 static int cm_init_jeita_table(struct charger_desc *desc, struct device *dev)
 {
 	int ret, i;
+	struct device_node *np;
+	int bat_id;
+
+	bat_id = get_battery_id();
+	np = of_parse_phandle(dev->of_node, "monitored-battery", bat_id);
+	if(!np) {
+		dev_err(dev, "[%s] jeita get monitored-battery fail\n", __func__);
+		np = dev->of_node;
+	}
 
 	for (i = CM_JEITA_DCP; i < CM_JEITA_MAX; i++) {
 		ret = cm_parse_jeita_table(desc,
 					   dev,
+					   np,
 					   jeita_type_names[i],
 					   &desc->jeita_tab_array[i]);
+		dev_err(dev, "[%s] jeita_type_names[%d] = %s\n", __func__, i, jeita_type_names[i]);
 		if (ret)
 			return ret;
 	}
@@ -3746,6 +4045,18 @@ static void cm_track_capacity_work(struct work_struct *work)
 		 * we need to encrypt it.
 		 */
 		cm->track.state = CAP_TRACK_IDLE;
+		if (is_batt_first_poweron(cm) && !cm->track.clear_cap_flag) {
+			file_buf[0] = 0 ^ CM_TRACK_CAPACITY_KEY0;
+			file_buf[1] = 0 ^ CM_TRACK_CAPACITY_KEY1;
+			ret = kernel_write(filep, &file_buf, sizeof(file_buf), &pos);
+			if (ret < 0) {
+				dev_err(cm->dev, "write file_buf data error\n");
+				goto out;
+			}
+			cm->track.clear_cap_flag = 1;
+			break;
+		}
+		dev_info(cm->dev, "clear_cap_flag = %d\n", cm->track.clear_cap_flag);
 		if (kernel_read(filep, (char *)&file_buf, sizeof(file_buf), &pos) < 0) {
 			dev_err(cm->dev, "track file is empty or read error\n");
 			goto out;
@@ -3758,7 +4069,7 @@ static void cm_track_capacity_work(struct work_struct *work)
 			goto out;
 		}
 
-		if (abs(total_cap - capacity) < total_cap / 2)
+		if (abs(total_cap - capacity) < total_cap / 5)
 			set_batt_total_cap(cm, capacity);
 		break;
 
@@ -3785,9 +4096,9 @@ out:
 
 static void cm_track_capacity_monitor(struct charger_manager *cm)
 {
-	int cur_now, ret;
-	int capacity, clbcnt, ocv, boot_volt, batt_uV;
-	u32 total_cap;
+	int ibat_avg, ret;
+	int capacity, clbcnt, ocv, boot_volt, vbat_avg;
+	u32 total_cap, chg_type;
 
 	if (!cm->track.cap_tracking)
 		return;
@@ -3803,13 +4114,13 @@ static void cm_track_capacity_monitor(struct charger_manager *cm)
 		return;
 	}
 
-	ret = get_batt_cur_now(cm, &cur_now);
+	ret = get_ibat_avg_uA(cm, &ibat_avg);
 	if (ret) {
 		dev_err(cm->dev, "failed to get relax current.\n");
 		return;
 	}
 
-	ret = get_batt_uV(cm, &batt_uV);
+	ret = get_vbat_avg_uV(cm, &vbat_avg);
 	if (ret) {
 		dev_err(cm->dev, "failed to get battery voltage.\n");
 		return;
@@ -3864,12 +4175,14 @@ static void cm_track_capacity_monitor(struct charger_manager *cm)
 				return;
 			}
 		} else {
-			if (abs(cur_now) > CM_TRACK_CAPACITY_START_CURRENT ||
+			if (abs(ibat_avg) > CM_TRACK_CAPACITY_START_CURRENT ||
 			    ocv > CM_TRACK_CAPACITY_START_VOLTAGE) {
 				dev_info(cm->dev, "not satisfy power on start condition.\n");
 				return;
 			}
 		}
+
+		dev_info(cm->dev, "start ibat_avg= %d, vbat_avg= %d, ocv= %d, boot_volt= %d\n", ibat_avg, vbat_avg, ocv, boot_volt);
 
 		/*
 		 * Parse the capacity table to look up the correct capacity percent
@@ -3884,6 +4197,7 @@ static void cm_track_capacity_monitor(struct charger_manager *cm)
 							      cm->desc->cap_table_len,
 							      ocv);
 		cm->track.start_cap *= 10;
+		dev_info(cm->dev, "is_charger_mode= %d, start_cap= %d\n", is_charger_mode, cm->track.start_cap);
 		/*
 		 * When the capacity tracking start condition is met,
 		 * the battery is almost empty,so we set a starting
@@ -3909,6 +4223,8 @@ static void cm_track_capacity_monitor(struct charger_manager *cm)
 			ktime_divns(ktime_get_boottime(), NSEC_PER_SEC);
 		cm->track.start_clbcnt = clbcnt;
 		cm->track.state = CAP_TRACK_UPDATING;
+
+		dev_info(cm->dev, "start_time= %d, clbcnt= %d\n", cm->track.start_time, clbcnt);
 		break;
 
 	case CAP_TRACK_UPDATING:
@@ -3925,8 +4241,24 @@ static void cm_track_capacity_monitor(struct charger_manager *cm)
 		 * stop charging condition as the the capacity
 		 * tracking end condition.
 		 */
-		if (batt_uV > cm->track.end_vol &&
-		    cur_now < cm->track.end_cur) {
+		if (vbat_avg > cm->track.end_vol &&
+		    ibat_avg < cm->track.end_cur) {
+			dev_info(cm->dev, "vbat_avg = %d, ibat_avg = %d, end_vol = %d, end_cur = %d\n",
+				vbat_avg, ibat_avg, cm->track.end_vol, cm->track.end_cur);
+
+			if (!is_ext_pwr_online(cm)) {
+				cm->track.state = CAP_TRACK_IDLE;
+				dev_err(cm->dev, "pwr not online, exit cap_track_updating\n");
+				return;
+			}
+
+			ret = get_charger_type(cm, &chg_type);
+			if (ret || (chg_type != POWER_SUPPLY_USB_TYPE_DCP)) {
+				cm->track.state = CAP_TRACK_IDLE;
+				dev_err(cm->dev, "not dcp, exit cap_track_updating, ret = %d\n", ret);
+				return;
+			}
+
 			ret = get_batt_energy_now(cm, &clbcnt);
 			if (ret) {
 				dev_err(cm->dev, "failed to get energy now.\n");
@@ -3939,7 +4271,7 @@ static void cm_track_capacity_monitor(struct charger_manager *cm)
 				return;
 			}
 			total_cap = total_cap / 1000;
-
+			dev_info(cm->dev, "end ibat_avg= %d, vbat_avg= %d, ocv= %d, boot_volt= %d\n", ibat_avg, vbat_avg, ocv, boot_volt);
 			/*
 			 * Due to the capacity tracking function started, the
 			 * coulomb amount corresponding to the initial
@@ -3959,10 +4291,11 @@ static void cm_track_capacity_monitor(struct charger_manager *cm)
 			 * capacity = total_cap * (start_cap / 100) + capacity
 			 */
 			capacity = (clbcnt - cm->track.start_clbcnt) / 1000;
+			dev_info(cm->dev, "clbcnt= %d, start_clbcnt= %d, capacity_temp= %d\n", clbcnt, cm->track.start_clbcnt, capacity);
 			capacity =
-				(total_cap * cm->track.start_cap) / 1000 + (u32)capacity;
-
-			if (abs(capacity - total_cap) < total_cap / 2) {
+				(total_cap * (u32)cm->track.start_cap) / 1000 + (u32)capacity;
+			dev_info(cm->dev, "total_cap= %d, start_cap= %d, capacity= %d\n", total_cap, cm->track.start_cap, capacity);
+			if (abs(capacity - total_cap) < total_cap / 5) {
 				set_batt_total_cap(cm, capacity);
 				cm->track.state = CAP_TRACK_DONE;
 				queue_delayed_work(system_power_efficient_wq,
@@ -3982,6 +4315,7 @@ static void cm_track_capacity_monitor(struct charger_manager *cm)
 	default:
 		break;
 	}
+	dev_info(cm->dev, "temperature = %d\n", cm->desc->temperature);
 }
 
 static struct charger_desc *of_cm_parse_desc(struct device *dev)
@@ -3992,11 +4326,14 @@ static struct charger_desc *of_cm_parse_desc(struct device *dev)
 	u32 battery_stat = CM_NO_BATTERY;
 	u32 num_chgs = 0;
 	int ret;
+	int bat_id;
 
 	desc = devm_kzalloc(dev, sizeof(*desc), GFP_KERNEL);
 	if (!desc)
 		return ERR_PTR(-ENOMEM);
-
+#ifdef CONFIG_WT_COMPILE_FACTORY_VERSION
+	desc->jeita_disabled = 1;
+#endif
 	of_property_read_string(np, "cm-name", &desc->psy_name);
 
 	of_property_read_u32(np, "cm-poll-mode", &poll_mode);
@@ -4009,7 +4346,10 @@ static struct charger_desc *of_cm_parse_desc(struct device *dev)
 					&desc->fullbatt_vchkdrop_ms);
 	of_property_read_u32(np, "cm-fullbatt-vchkdrop-volt",
 					&desc->fullbatt_vchkdrop_uV);
-	of_property_read_u32(np, "cm-fullbatt-voltage", &desc->fullbatt_uV);
+
+	bat_id = get_battery_id();
+	dev_info(dev, "%s bat_id = %d\n", __func__, bat_id);
+	of_property_read_u32_index(np, "cm-fullbatt-voltage", bat_id, &desc->fullbatt_uV);
 	of_property_read_u32(np, "cm-fullbatt-current", &desc->fullbatt_uA);
 	of_property_read_u32(np, "cm-fullbatt-soc", &desc->fullbatt_soc);
 	of_property_read_u32(np, "cm-fullbatt-capacity",
@@ -4079,11 +4419,16 @@ static struct charger_desc *of_cm_parse_desc(struct device *dev)
 			     &desc->fast_charge_voltage_drop);
 	of_property_read_u32(np, "cm-double-ic-total-limit-current",
 			     &desc->double_ic_total_limit_current);
+	of_property_read_u32(np, "cm-force-jeita-status",
+			     &desc->force_jeita_status);
 
 	/* Initialize the jeita temperature table. */
 	ret = cm_init_jeita_table(desc, dev);
 	if (ret)
 		return ERR_PTR(ret);
+
+	if (!desc->force_jeita_status)
+		desc->force_jeita_status = (desc->jeita_tab_size + 1) / 2;
 
 	ret = cm_init_cap_remap_table(desc, dev);
 	if (ret)
@@ -4166,10 +4511,14 @@ static int cm_get_bat_info(struct charger_manager *cm)
 	struct power_supply_battery_info info = { };
 	struct power_supply_battery_ocv_table *table;
 	int ret;
+	int bat_id = 0;
 
-	ret = power_supply_get_battery_info(cm->charger_psy, &info, 0);
+	bat_id = get_battery_id();
+	dev_info(cm->dev, "%s bat_id = %d\n", __func__, bat_id);
+
+	ret = power_supply_get_battery_info(cm->charger_psy, &info, bat_id);
 	if (ret) {
-		dev_err(cm->dev, "failed to get battery information\n");
+		dev_err(cm->dev, "[%s] failed to get battery information\n", __func__);
 		return ret;
 	}
 
@@ -4208,6 +4557,94 @@ static void cm_track_capacity_init(struct charger_manager *cm)
 	queue_delayed_work(system_power_efficient_wq,
 			   &cm->track.track_capacity_work,
 			   5 * HZ);
+	dev_info(cm->dev, "end_vol = %d, end_cur = %d\n", cm->track.end_vol, cm->track.end_cur);
+}
+
+static void cm_batt_ovp_check(struct charger_manager *cm)
+{
+	int ret, batt_uV;
+
+	ret = get_vbat_now_uV(cm, &batt_uV);
+	if (ret) {
+		dev_err(cm->dev, "get_vbat_now_uV error.\n");
+		return;
+	}
+
+	if (batt_uV >= BATTERY_VOLTAGE_MAX) {
+		set_batt_charge_status(BAT_OVP_SET, CM_BAT_OVP_STATUS, 0);
+		cm_enable_charge();
+		power_supply_changed(cm->charger_psy);
+		dev_err(cm->dev, "%s: bat volt:%d over Discharge!\n", __func__, batt_uV);
+	} else if ((batt_uV < BATTERY_RECHARGE_VOLTAGE) && (cm_battery_status & CM_BAT_OVP_STATUS)) {
+		set_batt_charge_status(BAT_OVP_SET, CM_BAT_OVP_STATUS, 1);
+		if (get_en_charge_state()) {
+			cm_enable_charge();
+			power_supply_changed(cm->charger_psy);
+			dev_err(cm->dev, "%s: bat volt:%d start charge\n", __func__, batt_uV);
+		} else {
+			set_batt_charge_status(BAT_OVP_SET, CM_BAT_OVP_STATUS, 0);
+			dev_err(cm->dev, "%s: bat volt:%d start charge, but other user stop charge\n", __func__, batt_uV);
+		}
+	}
+}
+
+static void cm_jeita_over_temp_check(struct charger_manager *cm)
+{
+	int ret, cur_temp;
+
+	ret = cm_get_battery_temperature_by_psy(cm, &cur_temp);
+	if (ret) {
+		dev_err(cm->dev, "failed to get battery temperature\n");
+		return;
+	}
+
+	if (cur_temp > JEITA_HIGHEST_TEMPE) {
+		set_batt_charge_status(OVER_JEITA_TEMP_LIMIT, CM_OVER_JEITA_TEMP_LIMIT, 0);
+		dev_err(cm->dev, "%s: batt_temp:%d over temp limit!\n", __func__, cur_temp);
+	} else if (cur_temp < JEITA_LOWEST_TEMPE) {
+		set_batt_charge_status(BELOW_JEITA_TEMP_LIMIT, CM_BELOW_JEITA_TEMP_LIMIT, 0);
+		dev_err(cm->dev, "%s: batt_temp:%d below temp limit!\n", __func__, cur_temp);
+	} else if (cm_battery_status & CM_OVER_JEITA_TEMP_LIMIT) {
+		set_batt_charge_status(OVER_JEITA_TEMP_LIMIT, CM_OVER_JEITA_TEMP_LIMIT, 1);
+		dev_info(cm->dev, "%s: batt_temp:%d form hot temp restore normal temp\n", __func__, cur_temp);
+	} else if (cm_battery_status & CM_BELOW_JEITA_TEMP_LIMIT) {
+		set_batt_charge_status(BELOW_JEITA_TEMP_LIMIT, CM_BELOW_JEITA_TEMP_LIMIT, 1);
+		dev_info(cm->dev, "%s: batt_temp:%d form low temp restore normal temp\n", __func__, cur_temp);
+	} else {
+		dev_info(cm->dev, "%s: batt_temp:%d, hold current status(cm_battery_status:0x%2x)\n", __func__, cur_temp, cm_battery_status);
+	}
+}
+
+static void cm_set_battery_para(void)
+{
+	bq2560x_set_batfet_dis();
+	bq2560x_set_iterm();
+}
+
+static void cm_batt_poor_contact(struct charger_manager *cm)
+{
+	int bat_id = BAT_COUNT;
+
+	bat_id = get_now_battery_id();
+	if (!is_batt_present(cm) || (bat_id == BAT_COUNT)) {
+		if ((cm_battery_status & CM_BATT_POOR_CONTACT) && !cm->charger_enabled)
+			return;
+		set_batt_charge_status(BAT_POOR_CONTACT, CM_BATT_POOR_CONTACT, 0);
+		try_charger_enable(cm, false);
+		cm_uevent_notify(cm);
+		power_supply_changed(cm->charger_psy);
+	} else if (cm_battery_status & CM_BATT_POOR_CONTACT) {
+		set_batt_charge_status(BAT_POOR_CONTACT, CM_BATT_POOR_CONTACT, 1);
+		if (get_en_charge_state()) {
+			try_charger_enable(cm, true);
+			cm_uevent_notify(cm);
+			power_supply_changed(cm->charger_psy);
+			dev_err(cm->dev, "%s: exit bat present, start charge\n", __func__);
+		} else {
+			set_batt_charge_status(BAT_POOR_CONTACT, CM_BATT_POOR_CONTACT, 0);
+			dev_err(cm->dev, "%s: bat present want to start charge, but other user stop charge\n", __func__);
+		}
+	}
 }
 
 static void cm_batt_works(struct work_struct *work)
@@ -4216,14 +4653,39 @@ static void cm_batt_works(struct work_struct *work)
 	struct charger_manager *cm = container_of(dwork,
 				struct charger_manager, cap_update_work);
 	struct timespec64 cur_time;
-	int batt_uV, batt_ocV, bat_uA, fuel_cap, chg_sts, ret;
-	int period_time, flush_time, cur_temp, board_temp;
-	int chg_cur = 0, chg_limit_cur = 0, charger_input_vol = 0;
+	int batt_uV, batt_ocV, bat_uA, fuel_cap, chg_sts, ret, i;
+	int period_time, flush_time, cur_temp, board_temp, charge_vol;
+	int chg_cur = 0, chg_limit_cur = 0, charger_input_vol = 0, value = 0;
 	static int last_fuel_cap = CM_CAP_MAGIC_NUM;
+	char reg_info[1024] = {0};
+	struct power_supply *fuel_gauge;
+	union power_supply_propval val;
 
-	ret = get_batt_uV(cm, &batt_uV);
+	cm_set_battery_para();
+	cm_batt_poor_contact(cm);
+	cm_jeita_over_temp_check(cm);
+	cm_batt_ovp_check(cm);
+
+	for (i = 0; i < OTHERS_MAX; i++) {
+		value |= enable_charger_arr[i];
+		dev_info(cm->dev, "get_en_charge_state user = %d, arr = %d\n", i, enable_charger_arr[i]);
+	}
+
+	fuel_gauge = power_supply_get_by_name(cm->desc->psy_fuel_gauge);
+	if (!fuel_gauge)
+		return ;
+
+	ret = power_supply_get_property(fuel_gauge,
+			POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE, &val);
+	power_supply_put(fuel_gauge);
+	if (ret)
+		return ;
+
+	charge_vol = val.intval;
+
+	ret = get_vbat_now_uV(cm, &batt_uV);
 	if (ret) {
-		dev_err(cm->dev, "get_batt_uV error.\n");
+		dev_err(cm->dev, "get_vbat_now_uV error.\n");
 		return;
 	}
 
@@ -4233,7 +4695,7 @@ static void cm_batt_works(struct work_struct *work)
 		return;
 	}
 
-	ret = get_batt_uA(cm, &bat_uA);
+	ret = get_ibat_now_uA(cm, &bat_uA);
 	if (ret) {
 		dev_err(cm->dev, "get bat_uA error.\n");
 		return;
@@ -4274,13 +4736,13 @@ static void cm_batt_works(struct work_struct *work)
 	if (ret)
 		dev_warn(cm->dev, "failed to get board temperature\n");
 
-	if (cur_temp <= CM_LOW_TEMP_REGION &&
+	/*if (cur_temp <= CM_LOW_TEMP_REGION &&
 	    batt_uV <= CM_LOW_TEMP_SHUTDOWN_VALTAGE) {
 		if (cm->desc->low_temp_trigger_cnt++ > 1)
 			fuel_cap = 0;
 	} else if (cm->desc->low_temp_trigger_cnt != 0) {
 		cm->desc->low_temp_trigger_cnt = 0;
-	}
+	}*/
 
 	if (fuel_cap > CM_CAP_FULL_PERCENT)
 		fuel_cap = CM_CAP_FULL_PERCENT;
@@ -4306,7 +4768,7 @@ static void cm_batt_works(struct work_struct *work)
 	 * capacity is larger than 99%.
 	 */
 	if (chg_sts == POWER_SUPPLY_STATUS_CHARGING) {
-		if (cm->desc->cap >= 986) {
+		if (cm->desc->cap >= 985) {
 			cm->desc->trickle_time =
 				cur_time.tv_sec - cm->desc->trickle_start_time;
 		} else {
@@ -4328,18 +4790,20 @@ static void cm_batt_works(struct work_struct *work)
 	else
 		cm->desc->charger_status = chg_sts;
 
-	dev_info(cm->dev, "battery voltage = %d, OCV = %d, current = %d, "
-		 "capacity = %d, charger status = %d, force set full = %d, "
+	ui_cap = DIV_ROUND_CLOSEST(cm->desc->cap, 10);
+	dev_info(cm->dev, "battery voltage = %d, OCV = %d, current = %d, vbus = %d, "
+		 "capacity = %d, ui_cap = %d, charger status = %d, force set full = %d, "
 		 "charging current = %d, charging limit current = %d, "
 		 "battery temperature = %d,board temperature = %d, "
 		 "track state = %d, charger type = %d, thm_adjust_cur = %d, "
-		 "charger input voltage = %d, "
 		 "is_fast_charge = %d, enable_fast_charge = %d\n",
-		 batt_uV, batt_ocV, bat_uA, fuel_cap, cm->desc->charger_status,
+		 batt_uV, batt_ocV, bat_uA, charger_input_vol, fuel_cap, ui_cap, cm->desc->charger_status,
 		 cm->desc->force_set_full, chg_cur, chg_limit_cur, cur_temp, board_temp,
 		 cm->track.state, cm->desc->charger_type, cm->desc->thm_adjust_cur,
-		 charger_input_vol, cm->desc->is_fast_charge,
-		 cm->desc->enable_fast_charge);
+		 cm->desc->is_fast_charge, cm->desc->enable_fast_charge);
+
+	get_charger_ic_reg_info(reg_info);
+	dev_info(cm->dev, "reg_info: %s\n", reg_info);
 
 	switch (cm->desc->charger_status) {
 	case POWER_SUPPLY_STATUS_CHARGING:
@@ -4384,7 +4848,7 @@ static void cm_batt_works(struct work_struct *work)
 		 * it will be mandatory to display 100%,
 		 * but the background is still charging.
 		 */
-		if (cm->desc->cap >= 995 &&
+		if (cm->desc->cap >= 985 &&
 		    cm->desc->trickle_time >= cm->desc->trickle_time_out &&
 		    cm->desc->trickle_time_out > 0 &&
 		    bat_uA > 0)
@@ -4413,19 +4877,28 @@ static void cm_batt_works(struct work_struct *work)
 				fuel_cap = cm->desc->cap;
 			}
 		} else {
-			if (period_time < cm->desc->cap_one_time &&
-			    (cm->desc->cap - fuel_cap) >= 5)
-				fuel_cap = cm->desc->cap - 5;
-			/*
-			 * If wake up from long sleep mode,
-			 * will make a percentage compensation based on time.
-			 */
-			if ((cm->desc->cap - fuel_cap) >=
-			    (flush_time / cm->desc->cap_one_time) * 10)
-				fuel_cap = cm->desc->cap -
-					(flush_time / cm->desc->cap_one_time) * 10;
-			else if (cm->desc->cap - fuel_cap > CM_CAP_ONE_PERCENT)
-				fuel_cap = cm->desc->cap - CM_CAP_ONE_PERCENT;
+			if (period_time < cm->desc->cap_one_time) {
+				if ((cm->desc->cap - fuel_cap) >= 5) {
+					if ((batt_uV <= (cm->desc->shutdown_voltage - CM_UVLO_OFFSET)) &&
+						((cm->desc->cap - fuel_cap) >= 10))
+						fuel_cap = cm->desc->cap - 10;
+					else
+						fuel_cap = cm->desc->cap - 5;
+				}
+				if (flush_time < cm->desc->cap_one_time &&
+					(DIV_ROUND_CLOSEST(fuel_cap, 10) != DIV_ROUND_CLOSEST(cm->desc->cap, 10)) &&
+					(batt_uV > cm->desc->shutdown_voltage))
+					fuel_cap = cm->desc->cap;
+			} else {
+				/*
+				 * If wake up from long sleep mode,
+				 * will make a percentage compensation based on time.
+				 */
+				if ((cm->desc->cap - fuel_cap) >=
+				    (period_time / cm->desc->cap_one_time) * 10)
+					fuel_cap = cm->desc->cap -
+						(period_time / cm->desc->cap_one_time) * 10;
+			}
 		}
 		break;
 
@@ -4440,7 +4913,7 @@ static void cm_batt_works(struct work_struct *work)
 				fuel_cap = CM_CAP_FULL_PERCENT;
 
 			if (fuel_cap > cm->desc->cap)
-				fuel_cap = cm->desc->cap + 1;
+				fuel_cap = cm->desc->cap + 5;
 		}
 
 		break;
@@ -4448,14 +4921,46 @@ static void cm_batt_works(struct work_struct *work)
 		break;
 	}
 
-	if (batt_uV <= cm->desc->shutdown_voltage - CM_UVLO_OFFSET) {
-		set_batt_cap(cm, 0);
-		dev_err(cm->dev, "WARN: batt_uV less than uvlo, will shutdown\n");
-		orderly_poweroff(true);
+	if (cur_temp >= CM_WORK_TEMP_MAX) {
+		dev_err(cm->dev, "cur_temp over max work temp\n");
+		kernel_power_off();
+	}
+
+	if ((batt_uV <= cm->desc->shutdown_voltage) &&
+		((cm->desc->charger_status == POWER_SUPPLY_STATUS_NOT_CHARGING) ||
+		(cm->desc->charger_status == POWER_SUPPLY_STATUS_DISCHARGING))) {
+		shutdown_low_cap_count++;
+		if (shutdown_low_cap_count >= 3) {
+			shutdown_low_cap_count = 3;
+			dev_err(cm->dev, "WARN: batt_uV less than %d, adjust_fuel_cap(cm, 0)\n", cm->desc->shutdown_voltage);
+			set_batt_cap(cm, 0);
+		}
+	} else {
+		shutdown_low_cap_count = 0;
+	}
+
+	dev_info(cm->dev, "battery cap shutdown_voltage: %d, %d\n", cm->desc->shutdown_voltage, cm->desc->shutdown_voltage - CM_UVLO_OFFSET);
+	if (batt_uV <= (cm->desc->shutdown_voltage - CM_UVLO_OFFSET)) {
+		shutdown_low_volt_count++;
+		dev_err(cm->dev, "WARN: batt_uV less than uvlo, i= %d\n", shutdown_low_volt_count);
+		if (shutdown_low_volt_count >= 3) {
+			shutdown_low_volt_count = 3;
+			if (ui_cap <= 0) {
+				set_batt_cap(cm, 0);
+				dev_err(cm->dev, "WARN: batt_uV less than uvlo, will shutdown\n");
+				orderly_poweroff(true);
+			}
+		}
+	} else {
+		shutdown_low_volt_count = 0;
 	}
 
 	dev_info(cm->dev, "battery cap = %d, charger manager cap = %d\n",
 		 fuel_cap, cm->desc->cap);
+
+#ifdef CONFIG_WT_COMPILE_FACTORY_VERSION
+        cm_ato_control_charge(cm, cm->desc->cap);
+#endif
 
 	if (fuel_cap != cm->desc->cap) {
 		if (DIV_ROUND_CLOSEST(fuel_cap, 10) != DIV_ROUND_CLOSEST(cm->desc->cap, 10)) {
@@ -4465,7 +4970,14 @@ static void cm_batt_works(struct work_struct *work)
 		}
 
 		cm->desc->cap = fuel_cap;
-		set_batt_cap(cm, cm_capacity_unmap(cm, cm->desc->cap));
+
+		if (shutdown_low_volt_count >= 3 && ui_cap <= 0) {
+			set_batt_cap(cm, 0);
+			dev_info(cm->dev, "battery cap set_batt_cap 0 !!\n");
+		} else {
+			set_batt_cap(cm, cm_capacity_unmap(cm, cm->desc->cap));
+			dev_info(cm->dev, "battery cap set_batt_cap %d !!\n", cm_capacity_unmap(cm, cm->desc->cap));
+		}
 	}
 
 	queue_delayed_work(system_power_efficient_wq,
@@ -4473,6 +4985,9 @@ static void cm_batt_works(struct work_struct *work)
 			   CM_CAP_CYCLE_TRACK_TIME * HZ);
 
 	cm_track_capacity_monitor(cm);
+
+	if (cur_temp >= CM_HIGH_TEMP_NOTIFY)
+		power_supply_changed(cm->charger_psy);
 }
 
 static int charger_manager_probe(struct platform_device *pdev)
@@ -4581,7 +5096,6 @@ static int charger_manager_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, cm);
 
 	memcpy(&cm->charger_psy_desc, &psy_default, sizeof(psy_default));
-
 	if (!desc->psy_name)
 		strncpy(cm->psy_name_buf, psy_default.name, PSY_NAME_MAX);
 	else
@@ -4742,6 +5256,9 @@ static int charger_manager_probe(struct platform_device *pdev)
 	}
 
 	queue_delayed_work(system_power_efficient_wq, &cm->cap_update_work, CM_CAP_CYCLE_TRACK_TIME * HZ);
+	get_battery_brand(cm);
+	dev_err(&pdev->dev, "[%s] cm->brand = %s\n", __func__, cm->brand);
+	hardwareinfo_set_prop(HARDWARE_BATTERY_ID, cm->brand);
 
 	return 0;
 
@@ -4793,7 +5310,13 @@ static void charger_manager_shutdown(struct platform_device *pdev)
 {
 	struct charger_manager *cm = platform_get_drvdata(pdev);
 
-	set_batt_cap(cm, cm_capacity_unmap(cm, cm->desc->cap));
+	if (shutdown_low_volt_count >= 3 && ui_cap <= 1) {
+		set_batt_cap(cm, 0);
+		dev_info(cm->dev, "%s :battery cap set_batt_cap 0 !!\n", __func__);
+	} else {
+		set_batt_cap(cm, cm_capacity_unmap(cm, cm->desc->cap));
+		dev_info(cm->dev, "%s :battery cap set_batt_cap %d %d!!\n", __func__, cm_capacity_unmap(cm, cm->desc->cap), cm->desc->cap);
+	}
 }
 
 static const struct platform_device_id charger_manager_id[] = {
@@ -5005,6 +5528,4 @@ void cm_notify_event(struct power_supply *psy, enum cm_event_types type,
 }
 EXPORT_SYMBOL_GPL(cm_notify_event);
 
-MODULE_AUTHOR("MyungJoo Ham <myungjoo.ham@samsung.com>");
-MODULE_DESCRIPTION("Charger Manager");
 MODULE_LICENSE("GPL");

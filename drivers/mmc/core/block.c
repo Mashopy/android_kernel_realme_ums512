@@ -890,9 +890,11 @@ static int mmc_blk_ioctl(struct block_device *bdev, fmode_t mode,
 		mmc_blk_put(md);
 		return ret;
 	case MMC_IOC_MULTI_CMD:
+#if 0
 		ret = mmc_blk_check_blkdev(bdev);
 		if (ret)
 			return ret;
+#endif
 		md = mmc_blk_get(bdev->bd_disk);
 		if (!md)
 			return -EINVAL;
@@ -1015,7 +1017,7 @@ static inline int mmc_blk_part_switch(struct mmc_card *card,
 
 		card->ext_csd.part_config = part_config;
 
-		ret = mmc_blk_part_switch_post(card, main_md->part_curr);
+		ret = mmc_blk_part_switch_post(card, part_type);
 	}
 
 	main_md->part_curr = part_type;

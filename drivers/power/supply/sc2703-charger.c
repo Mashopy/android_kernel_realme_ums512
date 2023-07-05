@@ -82,6 +82,7 @@ static const char * const sc2703_fast_charger_supply_name[] = {
 };
 
 static bool need_disable_dcdc;
+static bool disable_power_path;
 static bool sc2703_charger_is_support_fchg(struct sc2703_charger_info *info);
 static int sc2703_charger_get_online(struct sc2703_charger_info *info,
 				     u32 *online);
@@ -92,11 +93,11 @@ static int __init boot_mode(char *str)
 		return 0;
 
 	if (!strncmp(str, "cali", strlen("cali")))
-		need_disable_dcdc = true;
+		disable_power_path = true;
 	else if (!strncmp(str, "autotest", strlen("autotest")))
-		need_disable_dcdc = true;
+		disable_power_path = true;
 	else if (!strncmp(str, "factorytest", strlen("factorytest")))
-		need_disable_dcdc = true;
+		disable_power_path = true;
 
 	return 0;
 }
@@ -581,7 +582,7 @@ static void sc2703_charger_stop_charge(struct sc2703_charger_info *info,
 		 charge_vol > SC2703_CHARGER_VOLTAGE_MAX)
 		need_disable_dcdc = true;
 
-	if (need_disable_dcdc)
+	if (need_disable_dcdc || disable_power_path)
 		mask = SC2703_CHG_EN_MASK | SC2703_DCDC_EN_MASK;
 	else
 		mask = SC2703_CHG_EN_MASK;
@@ -757,10 +758,47 @@ static int sc2703_charger_get_online(struct sc2703_charger_info *info,
 	return 0;
 }
 
+static int sc2703_charger_set_fchg_current(struct sc2703_charger_info *info, u32 val)
+{
+	int ret, limit_cur, cur;
+
+	if (val == CM_FAST_CHARGE_ENABLE_CMD) {
+		limit_cur = info->cur.fchg_limit;
+		cur = info->cur.fchg_cur;
+	} else if (val == CM_FAST_CHARGE_DISABLE_CMD) {
+		limit_cur = info->cur.dcp_limit;
+		cur = info->cur.dcp_cur;
+	} else {
+		return 0;
+	}
+
+	ret = sc2703_charger_set_limit_current(info, limit_cur);
+	if (ret) {
+		dev_err(info->dev, "failed to set fchg limit current\n");
+		return ret;
+	}
+
+	ret = sc2703_charger_set_current(info, cur);
+	if (ret) {
+		dev_err(info->dev, "failed to set fchg current\n");
+		return ret;
+	}
+
+	return 0;
+}
+
 static int sc2703_charger_set_status(struct sc2703_charger_info *info, u32 val,
 				     bool present)
 {
 	int ret = 0;
+
+	ret = sc2703_charger_set_fchg_current(info, val);
+
+	if (ret)
+		return ret;
+
+	if (val > CM_FAST_CHARGE_NORMAL_CMD)
+		return 0;
 
 	if (!val && info->charging) {
 		sc2703_charger_stop_charge(info, present);
@@ -867,11 +905,6 @@ static void sc2703_charger_work(struct work_struct *data)
 		default:
 			limit_cur = info->cur.unknown_limit;
 			cur = info->cur.unknown_cur;
-		}
-
-		if (sc2703_charger_is_support_fchg(info)) {
-			limit_cur = info->cur.fchg_limit;
-			cur = info->cur.fchg_cur;
 		}
 
 		ret = sc2703_charger_set_limit_current(info, limit_cur);
@@ -1208,6 +1241,22 @@ static int sc2703_charger_enable_otg(struct regulator_dev *dev)
 			"Failed to set dc-dc output current limit:%d\n", ret);
 		return ret;
 	}
+
+	/*
+	 *Set minimum system voltage 3000mv; The OTG function can only be
+	 *used when Battery is above the minimum system voltage;
+	 *if there is high power consumption in a low-power situation, the
+	 *battery voltage will be pulled below the minimum system voltage.
+	 */
+
+	ret = regmap_update_bits(info->regmap, SC2703_CHG_CTRL_C,
+				 SC2703_VSYS_MIN_MASK, 0x00);
+	if (ret) {
+		dev_err(info->dev,
+			 "Failed to set minimum system voltage:%d\n", ret);
+		return ret;
+	}
+
 	/* Enable 2703 otg mode */
 	ret = regmap_update_bits(info->regmap, SC2703_DCDC_CTRL_A,
 				 SC2703_OTG_EN_MASK,
@@ -1240,6 +1289,15 @@ static int sc2703_charger_disable_otg(struct regulator_dev *dev)
 	if (ret) {
 		dev_err(info->dev,
 			"Failed to disable sc2703 otg ret.\n");
+		return ret;
+	}
+
+	/* Set minimum system voltage 3420mv;*/
+	ret = regmap_update_bits(info->regmap, SC2703_CHG_CTRL_C,
+				 SC2703_VSYS_MIN_MASK, 0x07);
+	if (ret) {
+		dev_err(info->dev,
+			 "Failed to set minimum system voltage:%d\n", ret);
 		return ret;
 	}
 

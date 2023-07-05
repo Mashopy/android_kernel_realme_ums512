@@ -22,11 +22,13 @@
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
+#include <linux/proc_fs.h>	
 #include "../core/card.h"
 #include "sprd-sdhcr11.h"
 #include <linux/sched/clock.h>
-
 #define DRIVER_NAME "sprd-sdhcr11"
+
+unsigned int sd_gpio;
 
 #ifdef CONFIG_EMMC_SOFTWARE_CQ_SUPPORT
 #define POLL_TIMEOUT             (500*1000)     /* 500us */
@@ -288,12 +290,21 @@ static void sprd_set_delay_value(struct sprd_sdhc_host *host)
 		break;
 	case MMC_TIMING_MMC_HS400:
 		if (host->ios.clock == 200000000) {
-			host->dll_dly = host->timing_dly->hs400_dly;
-			sprd_sdhc_writel(host, host->dll_dly,
-					SPRD_SDHC_REG_32_DLL_DLY);
-			dev_info(dev,
-				 "hs400 final timing delay value: 0x%08x\n",
-				 host->dll_dly);
+			if (host->ios.enhanced_strobe) {
+				host->dll_dly = host->timing_dly->hs400es_dly;
+				sprd_sdhc_writel(host, host->dll_dly,
+						SPRD_SDHC_REG_32_DLL_DLY);
+				dev_info(dev,
+					"hs400es final timing delay value: 0x%08x\n",
+					 host->dll_dly);
+			} else {
+				host->dll_dly = host->timing_dly->hs400_dly;
+				sprd_sdhc_writel(host, host->dll_dly,
+						SPRD_SDHC_REG_32_DLL_DLY);
+				dev_info(dev,
+					"hs400 final timing delay value: 0x%08x\n",
+					 host->dll_dly);
+			}
 		}
 		break;
 	default:
@@ -702,10 +713,15 @@ static void sprd_send_cmd(struct sprd_sdhc_host *host, struct mmc_command *cmd)
 	host->cmd = cmd;
 	if (data) {
 		/* set data param */
+#ifdef CONFIG_MMC_FFU_FUNCTION
+		WARN_ON((data->blksz * data->blocks > 524288*2) ||
+			(data->blksz > host->mmc->max_blk_size) ||
+			(data->blocks > 65535));
+#else
 		WARN_ON((data->blksz * data->blocks > 524288) ||
 			(data->blksz > host->mmc->max_blk_size) ||
 			(data->blocks > 65535));
-
+#endif
 		data->bytes_xfered = 0;
 
 		if_has_data = 1;
@@ -1045,12 +1061,10 @@ static irqreturn_t sprd_sdhc_irq(int irq, void *param)
 			spin_unlock(&host->lock);
 		return IRQ_NONE;
 	}
-
 #ifdef CONFIG_EMMC_SOFTWARE_CQ_SUPPORT
 	if (host->need_intr && host->need_polling)
 		cmdq_poll_wait_calc(host, cmd);
 #endif
-
 	intmask = sprd_sdhc_readl(host, SPRD_SDHC_REG_32_INT_STATE);
 	host->int_come |= intmask;
 	if (!intmask) {
@@ -1477,7 +1491,7 @@ static void sprd_sdhc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 		}
 
 		if (ios->clock <= 400000 || ios->timing == MMC_TIMING_SD_HS ||
-		    ios->clock == MMC_TIMING_MMC_HS ||
+		    ios->timing == MMC_TIMING_MMC_HS ||
 		    ios->timing == MMC_TIMING_LEGACY)
 			sdhc_set_dll_invert(host, SPRD_SDHC_BIT_CMD_DLY_INV |
 					    SPRD_SDHC_BIT_POSRD_DLY_INV, 1);
@@ -1496,10 +1510,18 @@ static void sprd_sdhc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 				mmc_gpio_get_cd(host->mmc))
 				sprd_sdhc_fast_hotplug_disable(host);
 			spin_unlock_irqrestore(&host->lock, flags);
+			if ((strcmp(host->device_name, "sdio_sd") == 0)) {
+				mmc->ios.signal_voltage = MMC_SIGNAL_VOLTAGE_330;
+				sprd_sdhc_set_vqmmc(mmc, &mmc->ios);/*make sure iovolate will keep 3.3V in next power up*/
+			}
 			sprd_signal_voltage_on_off(host, 0);
-			if (!IS_ERR(mmc->supply.vmmc))
-				mmc_regulator_set_ocr(host->mmc,
-						mmc->supply.vmmc, 0);
+			if (!IS_ERR(mmc->supply.vmmc)) {
+				if ((strcmp(host->device_name, "sdio_emmc") == 0) && (system_state == SYSTEM_RESTART))
+					{}
+                else
+                    mmc_regulator_set_ocr(host->mmc,
+                        mmc->supply.vmmc, 0);
+            }
 			spin_lock_irqsave(&host->lock, flags);
 			sprd_reset_ios(host);
 			host->ios.power_mode = ios->power_mode;
@@ -1595,8 +1617,9 @@ static void sprd_sdhc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
      * emmc is running in hs400 mode, and it will set hs400 delay timing not
      * enhanced strobe.
      */
-	if (!ios->enhanced_strobe)
-		sprd_set_delay_value(host);
+	if (ios->enhanced_strobe)
+		host->ios.enhanced_strobe = ios->enhanced_strobe;
+	sprd_set_delay_value(host);
 
 	if ((ios->clock > 52000000) && (clkchg_flag == 1)) {
 
@@ -1917,7 +1940,6 @@ static void sprd_sdhc_hs400_enhanced_strobe(struct mmc_host *mmc,
 {
 	struct sprd_sdhc_host *host = mmc_priv(mmc);
 	unsigned long flags;
-	struct device *dev = &host->pdev->dev;
 
 	sprd_sdhc_runtime_pm_get(host);
 	spin_lock_irqsave(&host->lock, flags);
@@ -1926,10 +1948,6 @@ static void sprd_sdhc_hs400_enhanced_strobe(struct mmc_host *mmc,
 		sprd_sdhc_sd_clk_off(host);
 		sprd_sdhc_set_uhs_mode(host, SPRD_SDHC_BIT_TIMING_MODE_HS400ES);
 		sprd_sdhc_sd_clk_on(host);
-		host->dll_dly = host->timing_dly->hs400es_dly;
-		sprd_sdhc_writel(host, host->dll_dly, SPRD_SDHC_REG_32_DLL_DLY);
-		dev_info(dev, "hs400es final timing delay value: 0x%08x\n",
-			 host->dll_dly);
 	}
 
 	mmiowb();
@@ -2084,7 +2102,9 @@ static int sprd_get_dt_resource(struct platform_device *pdev,
 	} else {
 		sprd_get_fast_hotplug_info(np, host);
 		host->detect_gpio_polar = flags;
+		sd_gpio = host->detect_gpio;
 	}
+
 	if (sprd_get_delay_value(pdev))
 		goto out;
 
@@ -2190,8 +2210,11 @@ static void sprd_set_mmc_struct(struct sprd_sdhc_host *host,
 	mmc->max_current_330 = SPRD_SDHC_MAX_CUR;
 	mmc->max_current_300 = SPRD_SDHC_MAX_CUR;
 	mmc->max_current_180 = SPRD_SDHC_MAX_CUR;
-
+#ifdef CONFIG_MMC_FFU_FUNCTION
+	mmc->max_req_size = 524288*2;	/* 512k */
+#else
 	mmc->max_req_size = 524288;	/* 512k */
+#endif
 	mmc->max_blk_count = 65535;
 	mmc->max_blk_size =  512 << (host_caps & SPRD_SDHC_BIT_BLOCK_SIZE_MASK);
 	if (host->flags & SPRD_USE_ADMA) {
@@ -2386,6 +2409,47 @@ static const struct of_device_id sprd_sdhc_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, sprd_sdhc_of_match);
 
+static int sd_card_status_show(struct seq_file *m, void *v)
+{
+    int gpio_value = 0;
+
+    gpio_value = __gpio_get_value(sd_gpio);
+    pr_debug("%s: gpio%d_value is %d\n", __func__, sd_gpio, gpio_value);
+
+    seq_printf(m, "%d\n", gpio_value);
+
+    return 0;
+}
+static int sd_card_status_proc_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, sd_card_status_show, NULL);
+}
+
+static const struct file_operations sd_card_status_fops = {
+    .open       = sd_card_status_proc_open,
+    .read       = seq_read,
+    .llseek     = seq_lseek,
+    .release    = single_release,
+};
+
+static int sd_card_tray_create_proc(void)
+{
+
+    struct proc_dir_entry *status_entry;
+
+    status_entry = proc_create("sd_tray_gpio_value", 0, NULL, &sd_card_status_fops);
+    if (!status_entry){
+        return -ENOMEM;
+    }
+
+    return 0;
+}
+
+static void sd_card_tray_remove_proc(void)
+{
+    remove_proc_entry("sd_tray_gpio_value", NULL);
+}
+
 static int sprd_sdhc_probe(struct platform_device *pdev)
 {
 	struct mmc_host *mmc;
@@ -2395,7 +2459,6 @@ static int sprd_sdhc_probe(struct platform_device *pdev)
 #ifdef CONFIG_EMMC_SOFTWARE_CQ_SUPPORT
 	int i;
 #endif
-
 	/* globe resource */
 	mmc = mmc_alloc_host(sizeof(struct sprd_sdhc_host), &pdev->dev);
 	if (!mmc) {
@@ -2469,6 +2532,14 @@ static int sprd_sdhc_probe(struct platform_device *pdev)
 	dev_info(dev, "%s[%s] host controller, irq %d\n",
 		 host->device_name, mmc_hostname(mmc), host->irq);
 
+    if ((strcmp(host->device_name, "sdio_sd") == 0)) {
+        if(sd_card_tray_create_proc()) {
+            dev_err(&pdev->dev, "creat proc sd_card_status failed\n");
+        } else {
+            dev_dbg(&pdev->dev, "creat proc sd_card_status successed\n");
+        }
+    }
+
 	return 0;
 
 err_free_host:
@@ -2493,6 +2564,10 @@ static int sprd_sdhc_remove(struct platform_device *pdev)
 			host->align_buffer, host->align_addr);
 	host->adma_desc = NULL;
 	host->align_buffer = NULL;
+
+    if((strcmp(host->device_name, "sdio_sd") == 0)){
+        sd_card_tray_remove_proc();
+    }
 
 	mmc_free_host(mmc);
 
