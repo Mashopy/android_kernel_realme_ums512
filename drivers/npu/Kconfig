@@ -1,0 +1,15 @@
+#
+# Spreadtrum NPU BSP drivers
+#
+
+menu "Spreadtrum Neural Process Unit (NPU) drivers"
+
+config NPU_VDSP
+	tristate "Spreadtrum NPU VDSP driver"
+	default n
+	help
+	  Say Y here if your device support Spreadtrum NPU VDSP driver.
+
+	  To compile this driver as a module, choose M here.
+
+endmenu
