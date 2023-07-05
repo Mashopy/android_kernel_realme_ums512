@@ -870,4 +870,14 @@ config INPUT_SC27XX_VIBRA
 	  To compile this driver as a module, choose M here. The module will
 	  be called sc27xx_vibra.
 
+config INPUT_SENSORS_ST_VL53L0
+	tristate "VL53L0 device with I2C bus"
+	depends on I2C
+	default n
+	help
+	  Say Y here if you have a VL53L0 device on the board and use I2C
+	  communication, else say N.
+
+	  To compile this driver as a module, choose M here.
+
 endif
