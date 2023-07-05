@@ -1,0 +1,40 @@
+#
+# Spreadtrum WCN BSP drivers
+#
+
+menu "Spreadtrum Wireless Connectivity (WCN) drivers"
+
+config WCN_BLUETOOTH
+	tristate "Spreadtrum WCN bluetooth driver"
+	default n
+	help
+	  Say Y here if your device support Spreadtrum WCN BSP bluetooth driver.
+
+	  To compile this driver as a module, choose M here.
+
+config WCN_FM
+	tristate "Spreadtrum WCN FM driver"
+	default n
+	help
+	  Say Y here if your device support Spreadtrum WCN BSP FM driver.
+
+	  To compile this driver as a module, choose M here.
+
+config WCN_WLAN
+	tristate "Spreadtrum WCN wlan driver"
+	default n
+	help
+	  Say Y here if your device support Spreadtrum WCN BSP wlan driver.
+
+	  To compile this driver as a module, choose M here.
+
+config WCN_WLAN_DEBUG
+	bool "Spreadtrum WCN wlan debugging"
+	depends on WCN_WLAN
+	default y
+	help
+	  Say Y here if you want to enable Spreadtrum WCN BSP wlan debugging.
+
+	  If unsure, say N.
+
+endmenu

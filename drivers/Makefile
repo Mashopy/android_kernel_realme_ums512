@@ -190,3 +190,6 @@ obj-$(CONFIG_GNSS)		+= gnss/
 # Spreadtrum NPU drivers
 obj-y				+= npu/
 
+# Spreadtrum WCN drivers
+obj-y				+= wcn/
+

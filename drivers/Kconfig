@@ -221,4 +221,6 @@ source "drivers/nfc/Kconfig"
 
 source "drivers/npu/Kconfig"
 
+source "drivers/wcn/Kconfig"
+
 endmenu
