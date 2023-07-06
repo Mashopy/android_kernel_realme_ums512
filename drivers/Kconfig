@@ -223,4 +223,6 @@ source "drivers/npu/Kconfig"
 
 source "drivers/wcn/Kconfig"
 
+source "drivers/camera/Kconfig"
+
 endmenu

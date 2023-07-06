@@ -1,0 +1,2 @@
+obj-$(CONFIG_SPRD_CAMERA_FLASH_DRV) += flash_drv/
+obj-$(CONFIG_SPRD_CAMERA_FLASH_OCP8137) += ocp8137/

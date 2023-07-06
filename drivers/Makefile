@@ -193,3 +193,5 @@ obj-y				+= npu/
 # Spreadtrum WCN drivers
 obj-y				+= wcn/
 
+# Spreadtrum camera drivers
+obj-y				+= camera/

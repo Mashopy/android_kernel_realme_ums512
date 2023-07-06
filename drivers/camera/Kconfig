@@ -1,0 +1,75 @@
+#
+# Spreadtrum camera BSP drivers
+#
+
+menu "Spreadtrum camera drivers"
+
+config SPRD_CAMERA_CORE
+	tristate "Spreadtrum camera core driver"
+	depends on SPRD_CAMERA_FLASH_DRV
+	depends on SPRD_CAMERA_SENSOR
+	default n
+	help
+	  Say Y here if your device support Spreadtrum camera core driver.
+
+	  To compile this driver as a module, choose M here.
+
+config SPRD_CAMERA_CPP
+	tristate "Spreadtrum camera cpp driver"
+	default n
+	help
+	  Say Y here if your device support Spreadtrum camera cpp driver.
+
+	  To compile this driver as a module, choose M here.
+
+config SPRD_CAMERA_FD
+	tristate "Spreadtrum camera fd driver"
+	default n
+	help
+	  Say Y here if your device support Spreadtrum camera fd driver.
+
+	  To compile this driver as a module, choose M here.
+
+config SPRD_CAMERA_FLASH
+	tristate "Spreadtrum camera flash drivers"
+	default n
+	help
+	  Say Y here if your device support Spreadtrum camera flash drivers.
+
+	  To compile thoses drivers as modules, choose M here.
+
+config SPRD_CAMERA_FLASH_DRV
+	tristate "Spreadtrum camera flash DRV driver"
+	depends on SPRD_CAMERA_FLASH
+	default n
+	help
+	  Say Y here if your device support Spreadtrum camera flash DRV driver.
+
+	  To compile this driver as a module, choose M here.
+
+config SPRD_CAMERA_FLASH_OCP8137
+	tristate "Spreadtrum camera flash ocp8137 driver"
+	depends on SPRD_CAMERA_FLASH
+	default n
+	help
+	  Say Y here if your device support Spreadtrum camera flash ocp8137 driver.
+
+	  To compile this driver as a module, choose M here.
+
+config SPRD_CAMERA_MMDVFS
+	tristate "Spreadtrum camera mmdvfs driver"
+	default n
+	help
+	  Say Y here if your device support Spreadtrum camera mmdvfs driver.
+
+	  To compile this driver as a module, choose M here.
+
+config SPRD_CAMERA_SENSOR
+	tristate "Spreadtrum camera sensor driver"
+	default n
+	help
+	  Say Y here if your device support Spreadtrum camera sensor driver.
+
+	  To compile this driver as a module, choose M here.
+
+endmenu
